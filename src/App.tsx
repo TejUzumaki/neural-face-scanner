@@ -122,7 +122,6 @@ function App() {
       <BootLoader />
       <RotateOverlay />
       
-      {/* Background Visual Layer */}
       <div className="absolute inset-0 z-0">
         {mode === 'webcam' && (
           <video ref={videoRef} className="w-full h-full object-cover -scale-x-100" playsInline muted />
@@ -132,7 +131,6 @@ function App() {
         )}
       </div>
 
-      {/* 3D Canvas Layer */}
       <Canvas className="absolute inset-0 z-10" camera={{ position: [0, 0, 5], fov: 45 }} dpr={[1, 2]}>
         <Suspense fallback={null}>
           <ambientLight intensity={0.8} />
@@ -141,10 +139,7 @@ function App() {
         </Suspense>
       </Canvas>
 
-      {/* UI Overlay Layer */}
       <div className="absolute inset-0 z-20 pointer-events-none flex flex-col justify-between p-6">
-        
-        {/* Top Header */}
         <div className="flex justify-between items-start">
           <motion.div 
             initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 2.5, duration: 0.8 }}
@@ -162,7 +157,6 @@ function App() {
           )}
         </div>
 
-        {/* Bottom Controls & Status */}
         <div className="flex flex-col items-center gap-5">
           <AnimatePresence mode="wait">
             <motion.div key={status} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>

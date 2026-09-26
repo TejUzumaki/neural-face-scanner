@@ -16,7 +16,6 @@ export default function FaceMesh3D({ faceData, texture }: FaceMesh3DProps) {
   const geometry = useMemo(() => {
     const geo = new THREE.BufferGeometry()
     geo.setIndex(new THREE.BufferAttribute(new Uint16Array(TRIANGULATION), 1))
-    // Initialize flat positions
     const initPos = new Float32Array(faceData.positions.length)
     for(let i=0; i<initPos.length; i+=3) {
       initPos[i] = faceData.positions[i]
@@ -41,16 +40,11 @@ export default function FaceMesh3D({ faceData, texture }: FaceMesh3DProps) {
 
   useFrame((_, delta) => {
     if (!solidMeshRef.current || !wireframeRef.current) return
-
-    // Smoothly animate morph progress
-    if (morphProgress.current < 1) {
-      morphProgress.current = Math.min(1, morphProgress.current + delta * 0.8)
-    }
+    if (morphProgress.current < 1) morphProgress.current = Math.min(1, morphProgress.current + delta * 0.8)
 
     const targetPositions = faceData.positions
     const currentPositions = solidMeshRef.current.geometry.attributes.position.array as Float32Array
     
-    // Lerp Z position for the morphing effect
     for (let i = 0; i < targetPositions.length; i += 3) {
       currentPositions[i] = targetPositions[i]
       currentPositions[i + 1] = targetPositions[i + 1]
@@ -59,14 +53,11 @@ export default function FaceMesh3D({ faceData, texture }: FaceMesh3DProps) {
 
     solidMeshRef.current.geometry.attributes.position.needsUpdate = true
     solidMeshRef.current.geometry.computeVertexNormals()
-
     wireframeRef.current.geometry.attributes.position.array.set(currentPositions)
     wireframeRef.current.geometry.attributes.position.needsUpdate = true
 
-    // Material opacity transitions
     const solidMat = solidMeshRef.current.material as THREE.MeshStandardMaterial
     const wireMat = wireframeRef.current.material as THREE.MeshBasicMaterial
-    
     solidMat.opacity = THREE.MathUtils.lerp(0, 1, morphProgress.current)
     wireMat.opacity = THREE.MathUtils.lerp(1, 0.2, morphProgress.current)
   })
@@ -85,15 +76,8 @@ export default function FaceMesh3D({ faceData, texture }: FaceMesh3DProps) {
           flatShading
         />
       </mesh>
-      
       <mesh ref={wireframeRef} geometry={geometry} scale={1.001}>
-        <meshBasicMaterial 
-          color="#00ffff" 
-          wireframe 
-          transparent 
-          opacity={1}
-          side={THREE.DoubleSide}
-        />
+        <meshBasicMaterial color="#00ffff" wireframe transparent opacity={1} side={THREE.DoubleSide} />
       </mesh>
     </group>
   )
