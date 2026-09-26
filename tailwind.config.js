@@ -1,18 +1,31 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-  content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
+  content: [
+    './index.html',
+    './src/**/*.{js,ts,jsx,tsx}',
+  ],
   theme: {
     extend: {
       fontFamily: {
-        sans: ['Space Grotesk', 'sans-serif'],
-        mono: ['JetBrains Mono', 'monospace'],
+        sans: [
+          'Inter',
+          'system-ui',
+          'sans-serif',
+        ],
+        mono: [
+          'JetBrains Mono',
+          'ui-monospace',
+          'SFMono-Regular',
+          'monospace',
+        ],
       },
       colors: {
-        accent: '#00ffff',
-        danger: '#ff5555',
-        panel: 'rgba(20, 20, 20, 0.6)',
-        border: 'rgba(255, 255, 255, 0.1)'
-      }
+        accent: '#8cff6a',
+        violet: '#9b7cff',
+      },
+      boxShadow: {
+        glass: '0 24px 80px rgba(0,0,0,.42)',
+      },
     },
   },
   plugins: [],

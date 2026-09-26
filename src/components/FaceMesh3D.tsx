@@ -1,84 +1,296 @@
-import { useRef, useMemo, useEffect } from 'react'
+import {
+  useEffect,
+  useMemo,
+  useRef,
+} from 'react'
 import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 import { TRIANGULATION } from '../utils/triangulation'
 
-interface FaceMesh3DProps {
-  faceData: { positions: Float32Array, uvs: Float32Array }
-  texture: string | null
+export interface FaceData {
+  positions: Float32Array
+  uvs: Float32Array
 }
 
-export default function FaceMesh3D({ faceData, texture }: FaceMesh3DProps) {
-  const solidMeshRef = useRef<THREE.Mesh>(null)
-  const wireframeRef = useRef<THREE.Mesh>(null)
-  const morphProgress = useRef(0)
+interface FaceMesh3DProps {
+  faceData: FaceData
+  texture?: string | null
+  accent?: string
+}
+
+export default function FaceMesh3D({
+  faceData,
+  texture = null,
+  accent = '#8cff6a',
+}: FaceMesh3DProps) {
+  const meshRef = useRef<THREE.Mesh>(null)
+  const wireRef = useRef<THREE.Mesh>(null)
+  const pointsRef = useRef<THREE.Points>(null)
+  const progress = useRef(0)
 
   const geometry = useMemo(() => {
     const geo = new THREE.BufferGeometry()
-    geo.setIndex(new THREE.BufferAttribute(new Uint16Array(TRIANGULATION), 1))
-    const initPos = new Float32Array(faceData.positions.length)
-    for(let i=0; i<initPos.length; i+=3) {
-      initPos[i] = faceData.positions[i]
-      initPos[i+1] = faceData.positions[i+1]
-      initPos[i+2] = 0 // Start flat
+
+    const initial = new Float32Array(
+      faceData.positions.length,
+    )
+
+    for (
+      let i = 0;
+      i < faceData.positions.length;
+      i += 3
+    ) {
+      initial[i] = faceData.positions[i]
+      initial[i + 1] =
+        faceData.positions[i + 1]
+      initial[i + 2] = 0
     }
-    geo.setAttribute('position', new THREE.BufferAttribute(initPos, 3))
-    geo.setAttribute('uv', new THREE.BufferAttribute(faceData.uvs, 2))
+
+    geo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(initial, 3),
+    )
+
+    geo.setAttribute(
+      'uv',
+      new THREE.BufferAttribute(
+        faceData.uvs,
+        2,
+      ),
+    )
+
+    geo.setIndex(
+      new THREE.BufferAttribute(
+        new Uint16Array(TRIANGULATION),
+        1,
+      ),
+    )
+
+    geo.computeVertexNormals()
+
     return geo
   }, [faceData])
 
-  const loadedTexture = useMemo(() => {
-    if (texture) {
-      const tex = new THREE.TextureLoader().load(texture)
-      tex.needsUpdate = true
-      return tex
+  const pointGeometry = useMemo(() => {
+    const geo = new THREE.BufferGeometry()
+    const initial = new Float32Array(
+      faceData.positions.length,
+    )
+
+    initial.set(faceData.positions)
+
+    geo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(initial, 3),
+    )
+
+    return geo
+  }, [faceData])
+
+  const sourceTexture = useMemo(() => {
+    if (!texture) {
+      return null
     }
-    return null
+
+    const loader = new THREE.TextureLoader()
+    const loaded = loader.load(texture)
+
+    loaded.colorSpace =
+      THREE.SRGBColorSpace
+
+    loaded.minFilter =
+      THREE.LinearFilter
+
+    loaded.magFilter =
+      THREE.LinearFilter
+
+    return loaded
   }, [texture])
 
-  useEffect(() => { morphProgress.current = 0 }, [faceData])
+  useEffect(() => {
+    progress.current = 0
+
+    return () => {
+      geometry.dispose()
+      pointGeometry.dispose()
+      sourceTexture?.dispose()
+    }
+  }, [
+    faceData,
+    geometry,
+    pointGeometry,
+    sourceTexture,
+  ])
 
   useFrame((_, delta) => {
-    if (!solidMeshRef.current || !wireframeRef.current) return
-    if (morphProgress.current < 1) morphProgress.current = Math.min(1, morphProgress.current + delta * 0.8)
+    const mesh = meshRef.current
+    const wire = wireRef.current
+    const points = pointsRef.current
 
-    const targetPositions = faceData.positions
-    const currentPositions = solidMeshRef.current.geometry.attributes.position.array as Float32Array
-    
-    for (let i = 0; i < targetPositions.length; i += 3) {
-      currentPositions[i] = targetPositions[i]
-      currentPositions[i + 1] = targetPositions[i + 1]
-      currentPositions[i + 2] = THREE.MathUtils.lerp(0, targetPositions[i + 2], morphProgress.current)
+    if (!mesh || !wire || !points) {
+      return
     }
 
-    solidMeshRef.current.geometry.attributes.position.needsUpdate = true
-    solidMeshRef.current.geometry.computeVertexNormals()
-    wireframeRef.current.geometry.attributes.position.array.set(currentPositions)
-    wireframeRef.current.geometry.attributes.position.needsUpdate = true
+    progress.current = Math.min(
+      1,
+      progress.current + delta * 0.72,
+    )
 
-    const solidMat = solidMeshRef.current.material as THREE.MeshStandardMaterial
-    const wireMat = wireframeRef.current.material as THREE.MeshBasicMaterial
-    solidMat.opacity = THREE.MathUtils.lerp(0, 1, morphProgress.current)
-    wireMat.opacity = THREE.MathUtils.lerp(1, 0.2, morphProgress.current)
+    const p = progress.current
+
+    const eased =
+      p * p * (3 - 2 * p)
+
+    const meshPositions =
+      mesh.geometry.attributes.position
+        .array as Float32Array
+
+    const wirePositions =
+      wire.geometry.attributes.position
+        .array as Float32Array
+
+    const pointPositions =
+      points.geometry.attributes.position
+        .array as Float32Array
+
+    for (
+      let i = 0;
+      i < faceData.positions.length;
+      i += 3
+    ) {
+      meshPositions[i] =
+        faceData.positions[i]
+
+      meshPositions[i + 1] =
+        faceData.positions[i + 1]
+
+      meshPositions[i + 2] =
+        THREE.MathUtils.lerp(
+          0,
+          faceData.positions[i + 2],
+          eased,
+        )
+
+      wirePositions[i] =
+        meshPositions[i]
+
+      wirePositions[i + 1] =
+        meshPositions[i + 1]
+
+      wirePositions[i + 2] =
+        meshPositions[i + 2]
+
+      pointPositions[i] =
+        meshPositions[i]
+
+      pointPositions[i + 1] =
+        meshPositions[i + 1]
+
+      pointPositions[i + 2] =
+        meshPositions[i + 2]
+    }
+
+    mesh.geometry.attributes.position.needsUpdate =
+      true
+
+    wire.geometry.attributes.position.needsUpdate =
+      true
+
+    points.geometry.attributes.position.needsUpdate =
+      true
+
+    mesh.geometry.computeVertexNormals()
+
+    const material =
+      mesh.material as THREE.MeshStandardMaterial
+
+    material.opacity =
+      THREE.MathUtils.lerp(
+        0.05,
+        0.88,
+        eased,
+      )
+
+    const wireMaterial =
+      wire.material as THREE.MeshBasicMaterial
+
+    wireMaterial.opacity =
+      THREE.MathUtils.lerp(
+        0.95,
+        0.28,
+        eased,
+      )
+
+    const pointMaterial =
+      points.material as THREE.PointsMaterial
+
+    pointMaterial.opacity =
+      THREE.MathUtils.lerp(
+        1,
+        0.2,
+        eased,
+      )
   })
 
   return (
-    <group scale={1.5}>
-      <mesh ref={solidMeshRef} geometry={geometry} castShadow>
-        <meshStandardMaterial 
-          map={loadedTexture}
-          color={loadedTexture ? "#ffffff" : "#00ffff"}
-          roughness={0.4} 
-          metalness={0.1} 
-          transparent 
+    <group
+      position={[0, 0, 0.25]}
+      scale={1.58}
+    >
+      <mesh
+        ref={meshRef}
+        geometry={geometry}
+        renderOrder={3}
+      >
+        <meshStandardMaterial
+          map={sourceTexture}
+          color={
+            sourceTexture
+              ? '#ffffff'
+              : '#9b7cff'
+          }
+          roughness={0.34}
+          metalness={0.28}
+          transparent
           opacity={0}
+          depthWrite={false}
           side={THREE.DoubleSide}
           flatShading
+          emissive={accent}
+          emissiveIntensity={0.06}
         />
       </mesh>
-      <mesh ref={wireframeRef} geometry={geometry} scale={1.001}>
-        <meshBasicMaterial color="#00ffff" wireframe transparent opacity={1} side={THREE.DoubleSide} />
+
+      <mesh
+        ref={wireRef}
+        geometry={geometry}
+        scale={1.002}
+        renderOrder={4}
+      >
+        <meshBasicMaterial
+          color={accent}
+          wireframe
+          transparent
+          opacity={1}
+          depthWrite={false}
+          side={THREE.DoubleSide}
+        />
       </mesh>
+
+      <points
+        ref={pointsRef}
+        geometry={pointGeometry}
+        renderOrder={5}
+      >
+        <pointsMaterial
+          color="#ffffff"
+          size={0.014}
+          sizeAttenuation
+          transparent
+          opacity={1}
+          depthWrite={false}
+        />
+      </points>
     </group>
   )
 }
