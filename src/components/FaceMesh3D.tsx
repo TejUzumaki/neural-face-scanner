@@ -4,62 +4,102 @@ import * as THREE from 'three'
 import { TRIANGULATION } from '../utils/triangulation'
 
 interface FaceMesh3DProps {
-  geometry: {
+  faceData: {
     positions: Float32Array
     uvs: Float32Array
-    indices: Uint16Array
   }
+  texture: string | null
 }
 
-export default function FaceMesh3D({ geometry }: FaceMesh3DProps) {
-  const meshRef = useRef<THREE.Mesh>(null)
-  const pointsRef = useRef<THREE.Points>(null)
+export default function FaceMesh3D({ faceData, texture }: FaceMesh3DProps) {
+  const solidMeshRef = useRef<THREE.Mesh>(null)
+  const wireframeRef = useRef<THREE.Mesh>(null)
   
-  // Setup geometry ONCE. We use TRIANGULATION to connect the 478 points into a solid mesh.
-  const bufferGeo = useMemo(() => {
+  // Morphing state (0 = flat image, 1 = full 3D)
+  const morphProgress = useRef(0)
+
+  const geometry = useMemo(() => {
     const geo = new THREE.BufferGeometry()
-    const indices = new Uint16Array(TRIANGULATION)
-    geo.setIndex(new THREE.BufferAttribute(indices, 1))
-    geo.setAttribute('position', new THREE.BufferAttribute(geometry.positions.slice(0), 3))
-    geo.setAttribute('uv', new THREE.BufferAttribute(geometry.uvs.slice(0), 2))
-    geo.computeVertexNormals()
+    geo.setIndex(new THREE.BufferAttribute(new Uint16Array(TRIANGULATION), 1))
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(faceData.positions.length), 3))
+    geo.setAttribute('uv', new THREE.BufferAttribute(faceData.uvs, 2))
     return geo
-  }, [])
+  }, [faceData])
 
-  // Every frame, just update the positions (Real-time performance optimization)
+  const loadedTexture = useMemo(() => {
+    if (texture) {
+      const tex = new THREE.TextureLoader().load(texture)
+      tex.needsUpdate = true
+      return tex
+    }
+    return null
+  }, [texture])
+
+  // Reset morph progress when a new face is detected
   useEffect(() => {
-    if (!meshRef.current) return
-    const posAttr = meshRef.current.geometry.getAttribute('position') as THREE.BufferAttribute
-    for (let i = 0; i < geometry.positions.length; i++) {
-      posAttr.array[i] = geometry.positions[i]
-    }
-    posAttr.needsUpdate = true
-    meshRef.current.geometry.computeVertexNormals()
-  }, [geometry])
+    morphProgress.current = 0
+  }, [faceData])
 
-  // Rotate slowly if not tracking webcam (for uploaded photos)
-  useFrame((state, delta) => {
-    if (meshRef.current && !geometry.indices.length) {
-      meshRef.current.rotation.y += delta * 0.2
+  useFrame((_, delta) => {
+    if (!solidMeshRef.current || !wireframeRef.current) return
+
+    // Animate morph progress from 0 to 1 over 2 seconds
+    if (morphProgress.current < 1) {
+      morphProgress.current = Math.min(1, morphProgress.current + delta * 0.5)
     }
+
+    const targetPositions = faceData.positions
+    const currentPositions = solidMeshRef.current.geometry.attributes.position.array as Float32Array
+    
+    // Lerp vertices from flat (z=0) to 3D (z=target)
+    for (let i = 0; i < targetPositions.length; i += 3) {
+      currentPositions[i] = targetPositions[i]
+      currentPositions[i + 1] = targetPositions[i + 1]
+      // Lerp Z position for the morphing effect
+      currentPositions[i + 2] = targetPositions[i + 2] * morphProgress.current
+    }
+
+    solidMeshRef.current.geometry.attributes.position.needsUpdate = true
+    solidMeshRef.current.geometry.computeVertexNormals()
+
+    // Copy positions to wireframe
+    wireframeRef.current.geometry.attributes.position.array.set(currentPositions)
+    wireframeRef.current.geometry.attributes.position.needsUpdate = true
+
+    // Material opacity transitions
+    const solidMat = solidMeshRef.current.material as THREE.MeshStandardMaterial
+    const wireMat = wireframeRef.current.material as THREE.MeshBasicMaterial
+    
+    // Solid mesh fades in, wireframe fades out
+    solidMat.opacity = morphProgress.current
+    wireMat.opacity = 1 - (morphProgress.current * 0.7)
   })
 
   return (
     <group scale={1.5}>
-      {/* Solid Low-Poly Mask with Flat Shading */}
-      <mesh ref={meshRef} geometry={bufferGeo} castShadow>
+      {/* Solid Textured Mask (Fades in) */}
+      <mesh ref={solidMeshRef} geometry={geometry} castShadow>
         <meshStandardMaterial 
-          color="#00ffff" 
-          flatShading 
-          roughness={0.3} 
-          metalness={0.8} 
+          map={loadedTexture}
+          color={loadedTexture ? "#ffffff" : "#00ffff"}
+          roughness={0.5} 
+          metalness={0.2} 
+          transparent 
+          opacity={0}
           side={THREE.DoubleSide}
+          flatShading
         />
       </mesh>
       
-      {/* Glowing Wireframe overlay to show the tech/math structure */}
-      <mesh geometry={bufferGeo} scale={1.001}>
-        <meshBasicMaterial color="#ff00ff" wireframe transparent opacity={0.3} />
+      {/* Glowing Wireframe (Fades out) */}
+      <mesh ref={wireframeRef} geometry={geometry} scale={1.001}>
+        <meshBasicMaterial 
+          color="#00ffff" 
+          wireframe 
+          transparent 
+          opacity={1}
+          side={THREE.DoubleSide}
+        />
       </mesh>
     </group>
   )
