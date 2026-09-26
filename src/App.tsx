@@ -2,6 +2,7 @@ import { Canvas } from '@react-three/fiber'
 import { Suspense, useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import FaceMesh3D from './components/FaceMesh3D'
+import { BootLoader, RotateOverlay, StatusBox, HudButton } from './components/ui/Overlay'
 import * as vision from '@mediapipe/tasks-vision'
 
 type Mode = 'idle' | 'upload' | 'webcam'
@@ -9,7 +10,8 @@ type Mode = 'idle' | 'upload' | 'webcam'
 function App() {
   const [faceData, setFaceData] = useState<{ positions: Float32Array, uvs: Float32Array } | null>(null)
   const [mode, setMode] = useState<Mode>('idle')
-  const [statusText, setStatusText] = useState('AWAITING NEURAL INPUT')
+  const [status, setStatus] = useState('AWAITING NEURAL INPUT')
+  const [subStatus, setSubStatus] = useState('STATE: IDLE')
   const [isLoading, setIsLoading] = useState(false)
   
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -18,7 +20,6 @@ function App() {
   const streamRef = useRef<MediaStream | null>(null)
   const landmarkerRef = useRef<vision.FaceLandmarker | null>(null)
 
-  // Load AI Model
   useEffect(() => {
     const loadModel = async () => {
       const filesetResolver = await vision.FilesetResolver.forVisionTasks(
@@ -53,10 +54,8 @@ function App() {
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file || !landmarkerRef.current) return
-
-    setIsLoading(true)
-    setMode('upload')
-    setStatusText('SCANNING IMAGE...')
+    setIsLoading(true); setMode('upload')
+    setStatus('SCANNING IMAGE...'); setSubStatus('STATE: PROCESSING')
     
     const reader = new FileReader()
     reader.onload = async (event) => {
@@ -67,10 +66,11 @@ function App() {
         const result = landmarkerRef.current.detect(img)
         if (result.faceLandmarks.length > 0) {
           setFaceData(processLandmarks(result.faceLandmarks[0]))
-          setStatusText('MORPHING SEQUENCE INITIATED')
-          setTimeout(() => setStatusText('3D RECONSTRUCTION COMPLETE'), 2500)
+          setStatus('MORPHING SEQUENCE INITIATED')
+          setSubStatus('STATE: RECONSTRUCTING')
+          setTimeout(() => { setStatus('3D RECONSTRUCTION COMPLETE'); setSubStatus('STATE: READY') }, 2500)
         } else {
-          setStatusText('NO FACE DETECTED')
+          setStatus('NO FACE DETECTED'); setSubStatus('STATE: ERROR')
         }
         setIsLoading(false)
       }
@@ -80,26 +80,22 @@ function App() {
 
   const startWebcam = async () => {
     if (!landmarkerRef.current) return
-    setMode('webcam')
-    setIsLoading(true)
-    setStatusText('REQUESTING CAMERA ACCESS...')
-    
+    setMode('webcam'); setIsLoading(true)
+    setStatus('REQUESTING CAMERA ACCESS...'); setSubStatus('STATE: BOOTING')
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } })
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
         videoRef.current.onloadedmetadata = () => {
-          videoRef.current?.play()
-          setIsLoading(false)
-          setStatusText('LIVE NEURAL TRACKING ACTIVE')
+          videoRef.current?.play(); setIsLoading(false)
+          setStatus('LIVE NEURAL TRACKING ACTIVE'); setSubStatus('STATE: LIVE')
           detectWebcam()
         }
       }
     } catch (error) {
-      setStatusText('CAMERA ACCESS DENIED')
-      setIsLoading(false)
-      setMode('idle')
+      setStatus('CAMERA ACCESS DENIED'); setSubStatus('STATE: ERROR')
+      setIsLoading(false); setMode('idle')
     }
   }
 
@@ -117,23 +113,26 @@ function App() {
 
   const stopWebcam = () => {
     streamRef.current?.getTracks().forEach(t => t.stop())
-    setMode('idle')
-    setFaceData(null)
-    setStatusText('AWAITING NEURAL INPUT')
+    setMode('idle'); setFaceData(null)
+    setStatus('AWAITING NEURAL INPUT'); setSubStatus('STATE: IDLE')
   }
 
   return (
     <div className="relative w-full h-full bg-black overflow-hidden">
+      <BootLoader />
+      <RotateOverlay />
       
-      {/* --- Background Visual Layer (Video or Image) --- */}
-      {mode === 'webcam' && (
-        <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover -scale-x-100" playsInline muted />
-      )}
-      {mode === 'upload' && imageRef.current && (
-        <img src={imageRef.current.src} className="absolute inset-0 w-full h-full object-cover opacity-70" alt="Source" />
-      )}
+      {/* Background Visual Layer */}
+      <div className="absolute inset-0 z-0">
+        {mode === 'webcam' && (
+          <video ref={videoRef} className="w-full h-full object-cover -scale-x-100" playsInline muted />
+        )}
+        {mode === 'upload' && imageRef.current && (
+          <img src={imageRef.current.src} className="w-full h-full object-cover opacity-70" alt="Source" />
+        )}
+      </div>
 
-      {/* --- 3D Canvas Layer (Transparent Overlay) --- */}
+      {/* 3D Canvas Layer */}
       <Canvas className="absolute inset-0 z-10" camera={{ position: [0, 0, 5], fov: 45 }} dpr={[1, 2]}>
         <Suspense fallback={null}>
           <ambientLight intensity={0.8} />
@@ -142,67 +141,58 @@ function App() {
         </Suspense>
       </Canvas>
 
-      {/* --- UI Overlay Layer --- */}
+      {/* UI Overlay Layer */}
       <div className="absolute inset-0 z-20 pointer-events-none flex flex-col justify-between p-6">
         
         {/* Top Header */}
         <div className="flex justify-between items-start">
-          <div className="glass-panel px-4 py-2 rounded-lg">
-            <h1 className="text-sm font-bold tracking-widest" style={{ color: 'var(--accent)' }}>NEURAL SCANNER</h1>
-          </div>
+          <motion.div 
+            initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 2.5, duration: 0.8 }}
+            className="bg-black/70 border border-white/10 backdrop-blur-md px-4 py-2 rounded-lg"
+          >
+            <h1 className="text-sm font-bold tracking-[0.2em] text-accent font-sans">NEURAL SCANNER</h1>
+          </motion.div>
           
-          <div className="flex gap-2 pointer-events-auto">
-            {mode === 'webcam' ? (
-              <button onClick={stopWebcam} className="hud-btn">
+          {mode === 'webcam' && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="pointer-events-auto">
+              <HudButton onClick={stopWebcam} variant="danger">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-              </button>
-            ) : null}
-          </div>
+              </HudButton>
+            </motion.div>
+          )}
         </div>
 
         {/* Bottom Controls & Status */}
-        <div className="flex flex-col items-center gap-4">
-          
-          {/* Status Box (Portal FX style) */}
-          <motion.div 
-            initial={{ opacity: 0, y: 20 }} 
-            animate={{ opacity: 1, y: 0 }} 
-            className="glass-panel px-6 py-3 rounded-lg text-center min-w-[280px]"
-          >
-            <div className="text-xs font-medium tracking-wider text-white" style={{ fontFamily: 'JetBrains Mono' }}>
-              {isLoading ? 'PROCESSING...' : statusText}
-            </div>
-          </motion.div>
+        <div className="flex flex-col items-center gap-5">
+          <AnimatePresence mode="wait">
+            <motion.div key={status} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <StatusBox status={status} subStatus={subStatus} />
+            </motion.div>
+          </AnimatePresence>
 
-          {/* Action Buttons */}
-          <div className="flex gap-4 pointer-events-auto">
-            <input type="file" ref={fileInputRef} onChange={handleImageUpload} accept="image/*" className="hidden" />
-            
-            {mode !== 'webcam' && (
+          {mode === 'idle' && (
+            <motion.div 
+              initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 2.7, duration: 0.8 }}
+              className="flex gap-4 pointer-events-auto"
+            >
+              <input type="file" ref={fileInputRef} onChange={handleImageUpload} accept="image/*" className="hidden" />
               <motion.button 
                 whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
                 onClick={() => fileInputRef.current?.click()} 
-                disabled={isLoading}
-                className="glass-panel px-6 py-3 rounded-lg text-xs font-bold tracking-widest text-white hover:bg-white/10 transition-colors disabled:opacity-50"
+                className="bg-black/70 border border-white/10 backdrop-blur-md px-6 py-3 rounded-lg text-xs font-bold tracking-[0.2em] text-white hover:bg-white/10 transition-colors font-sans"
               >
                 UPLOAD IMAGE
               </motion.button>
-            )}
-
-            {mode !== 'webcam' ? (
               <motion.button 
                 whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
                 onClick={startWebcam} 
-                disabled={isLoading}
-                className="px-6 py-3 rounded-lg text-xs font-bold tracking-widest text-black transition-colors disabled:opacity-50"
-                style={{ background: 'var(--accent)' }}
+                className="bg-accent text-black px-6 py-3 rounded-lg text-xs font-bold tracking-[0.2em] hover:bg-white transition-colors font-sans"
               >
                 LIVE WEBCAM
               </motion.button>
-            ) : null}
-          </div>
+            </motion.div>
+          )}
         </div>
-
       </div>
     </div>
   )
