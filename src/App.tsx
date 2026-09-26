@@ -1,5 +1,5 @@
+import React, { Suspense, useState, useRef, useEffect } from 'react'
 import { Canvas } from '@react-three/fiber'
-import { Suspense, useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import FaceMesh3D from './components/FaceMesh3D'
 import { BootLoader, RotateOverlay, StatusBox, HudButton } from './components/ui/Overlay'
