@@ -2,17 +2,23 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ChangeEvent,
 } from 'react'
 import { Canvas } from '@react-three/fiber'
 import {
+  OrbitControls,
+  PerspectiveCamera,
+} from '@react-three/drei'
+import {
   AnimatePresence,
   motion,
 } from 'framer-motion'
 import * as vision from '@mediapipe/tasks-vision'
 
+import BlankHead from './components/BlankHead'
 import FaceMesh3D, {
   type FaceData,
 } from './components/FaceMesh3D'
@@ -29,14 +35,28 @@ type Mode =
   | 'upload'
   | 'webcam'
 
+interface SavedAsset {
+  id: string
+  name: string
+  createdAt: string
+  sourceImage: string
+  positions: number[]
+  uvs: number[]
+  mirrored: boolean
+}
+
 const WASM_URL =
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm'
 
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
 
+const ASSET_STORAGE_KEY =
+  'neural-face-scanner-assets-v1'
+
 function normalizeLandmarks(
   landmarks: vision.NormalizedLandmark[],
+  mirrored: boolean,
 ): FaceData {
   const positions = new Float32Array(
     landmarks.length * 3,
@@ -46,6 +66,37 @@ function normalizeLandmarks(
     landmarks.length * 2,
   )
 
+  const nose = landmarks[1] ?? landmarks[4]
+
+  const noseX = mirrored
+    ? 1 - nose.x
+    : nose.x
+
+  const noseY = nose.y
+  const noseZ = nose.z
+
+  const leftEye =
+    landmarks[33]
+
+  const rightEye =
+    landmarks[263]
+
+  const leftX = mirrored
+    ? 1 - leftEye.x
+    : leftEye.x
+
+  const rightX = mirrored
+    ? 1 - rightEye.x
+    : rightEye.x
+
+  const eyeDistance = Math.max(
+    0.08,
+    Math.abs(rightX - leftX),
+  )
+
+  const scale =
+    1.62 / eyeDistance
+
   for (
     let i = 0;
     i < landmarks.length;
@@ -53,20 +104,31 @@ function normalizeLandmarks(
   ) {
     const landmark = landmarks[i]
 
-    const x =
-      (landmark.x - 0.5) * 2.65
+    const xNorm =
+      (mirrored
+        ? 1 - landmark.x
+        : landmark.x) - noseX
 
-    const y =
-      -(landmark.y - 0.5) * 2.65
+    const yNorm =
+      landmark.y - noseY
 
-    const z =
-      -landmark.z * 2.05
+    const zNorm =
+      landmark.z - noseZ
 
-    positions[i * 3] = x
-    positions[i * 3 + 1] = y
-    positions[i * 3 + 2] = z
+    positions[i * 3] =
+      xNorm * scale
 
-    uvs[i * 2] = landmark.x
+    positions[i * 3 + 1] =
+      -yNorm * scale
+
+    positions[i * 3 + 2] =
+      -zNorm * scale * 1.35
+
+    const imageX = mirrored
+      ? 1 - landmark.x
+      : landmark.x
+
+    uvs[i * 2] = imageX
     uvs[i * 2 + 1] =
       1 - landmark.y
   }
@@ -74,7 +136,43 @@ function normalizeLandmarks(
   return {
     positions,
     uvs,
+    mirrored,
   }
+}
+
+function readFileAsDataUrl(
+  file: File,
+): Promise<string> {
+  return new Promise(
+    (resolve, reject) => {
+      const reader = new FileReader()
+
+      reader.onload = () => {
+        if (
+          typeof reader.result ===
+          'string'
+        ) {
+          resolve(reader.result)
+        } else {
+          reject(
+            new Error(
+              'Could not create image data.',
+            ),
+          )
+        }
+      }
+
+      reader.onerror = () =>
+        reject(
+          reader.error ??
+            new Error(
+              'Could not read image.',
+            ),
+        )
+
+      reader.readAsDataURL(file)
+    },
+  )
 }
 
 function App() {
@@ -86,6 +184,12 @@ function App() {
 
   const [imageSrc, setImageSrc] =
     useState<string | null>(null)
+
+  const [sourceName, setSourceName] =
+    useState('Untitled Face')
+
+  const [assetSaved, setAssetSaved] =
+    useState(false)
 
   const [status, setStatus] =
     useState('AWAITING NEURAL INPUT')
@@ -99,11 +203,23 @@ function App() {
   const [error, setError] =
     useState<string | null>(null)
 
+  const [showWireframe, setShowWireframe] =
+    useState(true)
+
+  const [showPoints, setShowPoints] =
+    useState(false)
+
+  const [showBlankHead, setShowBlankHead] =
+    useState(true)
+
+  const [sourceTimestamp, setSourceTimestamp] =
+    useState('')
+
+  const [assetVersion, setAssetVersion] =
+    useState(0)
+
   const inputRef =
     useRef<HTMLInputElement>(null)
-
-  const imageRef =
-    useRef<HTMLImageElement | null>(null)
 
   const videoRef =
     useRef<HTMLVideoElement | null>(null)
@@ -128,6 +244,9 @@ function App() {
   const objectUrlRef =
     useRef<string | null>(null)
 
+  const sourceDataUrlRef =
+    useRef<string | null>(null)
+
   const setScannerMode =
     useCallback((next: Mode) => {
       modeRef.current = next
@@ -145,10 +264,8 @@ function App() {
       }
     }, [])
 
-  const stopWebcam =
+  const stopCameraTracks =
     useCallback(() => {
-      stopAnimationLoop()
-
       streamRef.current
         ?.getTracks()
         .forEach((track) => {
@@ -156,20 +273,35 @@ function App() {
         })
 
       streamRef.current = null
-
       lastVideoTimeRef.current = -1
+    }, [])
 
-      setScannerMode('idle')
-      setFaceData(null)
+  const clearObjectUrl =
+    useCallback(() => {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(
+          objectUrlRef.current,
+        )
 
-      setStatus(
-        'AWAITING NEURAL INPUT',
-      )
+        objectUrlRef.current = null
+      }
+    }, [])
 
-      setSubStatus('STATE: IDLE')
+  const stopWebcam =
+    useCallback(() => {
+      stopAnimationLoop()
+      stopCameraTracks()
+
+      if (
+        modeRef.current ===
+        'webcam'
+      ) {
+        setScannerMode('idle')
+      }
     }, [
       setScannerMode,
       stopAnimationLoop,
+      stopCameraTracks,
     ])
 
   useEffect(() => {
@@ -239,26 +371,18 @@ function App() {
       cancelled = true
 
       stopAnimationLoop()
-
-      streamRef.current
-        ?.getTracks()
-        .forEach((track) => {
-          track.stop()
-        })
-
-      streamRef.current = null
+      stopCameraTracks()
 
       landmarkerRef.current?.close()
-
       landmarkerRef.current = null
 
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(
-          objectUrlRef.current,
-        )
-      }
+      clearObjectUrl()
     }
-  }, [stopAnimationLoop])
+  }, [
+    clearObjectUrl,
+    stopAnimationLoop,
+    stopCameraTracks,
+  ])
 
   const switchRunningMode =
     useCallback(
@@ -290,9 +414,7 @@ function App() {
 
         event.target.value = ''
 
-        if (!file) {
-          return
-        }
+        if (!file) return
 
         if (
           !landmarkerRef.current ||
@@ -310,19 +432,15 @@ function App() {
         }
 
         stopWebcam()
+        clearObjectUrl()
 
         setError(null)
-
+        setAssetSaved(false)
         setScannerMode('upload')
-
-        setStatus(
-          'ANALYZING IMAGE',
-        )
-
+        setStatus('ANALYZING IMAGE')
         setSubStatus(
           'STATE: LANDMARK EXTRACTION',
         )
-
         setFaceData(null)
 
         try {
@@ -330,25 +448,24 @@ function App() {
             'IMAGE',
           )
 
-          const url =
-            URL.createObjectURL(
+          const objectUrl =
+            URL.createObjectURL(file)
+
+          objectUrlRef.current =
+            objectUrl
+
+          const dataUrl =
+            await readFileAsDataUrl(
               file,
             )
 
-          if (objectUrlRef.current) {
-            URL.revokeObjectURL(
-              objectUrlRef.current,
-            )
-          }
-
-          objectUrlRef.current = url
+          sourceDataUrlRef.current =
+            dataUrl
 
           const image =
             new Image()
 
-          imageRef.current = image
-
-          image.src = url
+          image.src = objectUrl
 
           await image.decode()
 
@@ -372,20 +489,42 @@ function App() {
             return
           }
 
-          setImageSrc(url)
-
-          setFaceData(
+          const data =
             normalizeLandmarks(
               landmarks,
+              false,
+            )
+
+          setImageSrc(dataUrl)
+          setFaceData(data)
+
+          setSourceName(
+            file.name.replace(
+              /\.[^/.]+$/,
+              '',
+            ) || 'Untitled Face',
+          )
+
+          setSourceTimestamp(
+            new Date().toLocaleString(
+              undefined,
+              {
+                dateStyle: 'medium',
+                timeStyle: 'short',
+              },
             ),
           )
 
+          setAssetVersion(
+            (value) => value + 1,
+          )
+
           setStatus(
-            'MORPHING INTO 3D',
+            'TRIANGULATING FACE',
           )
 
           setSubStatus(
-            'STATE: RECONSTRUCTION',
+            'STATE: 478-POINT SURFACE',
           )
 
           window.setTimeout(() => {
@@ -394,14 +533,14 @@ function App() {
               'upload'
             ) {
               setStatus(
-                '3D RECONSTRUCTION COMPLETE',
+                '3D RECONSTRUCTION READY',
               )
 
               setSubStatus(
-                'STATE: READY',
+                'STATE: INSPECT MODEL',
               )
             }
-          }, 1500)
+          }, 1600)
         } catch (err) {
           console.error(err)
 
@@ -419,6 +558,7 @@ function App() {
         }
       },
       [
+        clearObjectUrl,
         modelReady,
         setScannerMode,
         stopWebcam,
@@ -462,18 +602,20 @@ function App() {
             result.faceLandmarks?.[0]
 
           if (landmarks?.length) {
-            setFaceData(
+            const data =
               normalizeLandmarks(
                 landmarks,
-              ),
-            )
+                true,
+              )
+
+            setFaceData(data)
 
             setStatus(
               'LIVE NEURAL TRACKING',
             )
 
             setSubStatus(
-              'STATE: TRACKING',
+              'STATE: MIRRORED COORDINATES',
             )
           } else {
             setFaceData(null)
@@ -537,27 +679,20 @@ function App() {
       }
 
       stopAnimationLoop()
-
-      streamRef.current
-        ?.getTracks()
-        .forEach((track) => {
-          track.stop()
-        })
+      stopCameraTracks()
+      clearObjectUrl()
 
       setError(null)
-
+      setAssetSaved(false)
       setScannerMode('webcam')
-
-      setStatus(
-        'REQUESTING CAMERA',
-      )
-
+      setStatus('REQUESTING CAMERA')
       setSubStatus(
         'STATE: PERMISSION',
       )
 
       setFaceData(null)
       setImageSrc(null)
+      sourceDataUrlRef.current = null
 
       try {
         await switchRunningMode(
@@ -568,16 +703,13 @@ function App() {
           await navigator.mediaDevices.getUserMedia(
             {
               audio: false,
-
               video: {
                 facingMode: {
                   ideal: 'user',
                 },
-
                 width: {
                   ideal: 1280,
                 },
-
                 height: {
                   ideal: 720,
                 },
@@ -606,7 +738,7 @@ function App() {
         )
 
         setSubStatus(
-          'STATE: CALIBRATING',
+          'STATE: MIRRORED COORDINATES',
         )
 
         lastVideoTimeRef.current =
@@ -619,13 +751,7 @@ function App() {
       } catch (err) {
         console.error(err)
 
-        streamRef.current
-          ?.getTracks()
-          .forEach((track) => {
-            track.stop()
-          })
-
-        streamRef.current = null
+        stopCameraTracks()
 
         setScannerMode('idle')
 
@@ -642,43 +768,153 @@ function App() {
         )
       }
     }, [
+      clearObjectUrl,
       modelReady,
       scanVideoFrame,
       setScannerMode,
       stopAnimationLoop,
+      stopCameraTracks,
       switchRunningMode,
+    ])
+
+  const saveAsset =
+    useCallback(() => {
+      if (
+        !faceData ||
+        !sourceDataUrlRef.current
+      ) {
+        setError(
+          'A reconstructed source image is required before saving.',
+        )
+
+        return
+      }
+
+      const asset: SavedAsset = {
+        id: crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}`,
+        name:
+          sourceName.trim() ||
+          'Untitled Face',
+        createdAt:
+          new Date().toISOString(),
+        sourceImage:
+          sourceDataUrlRef.current,
+        positions: Array.from(
+          faceData.positions,
+        ),
+        uvs: Array.from(
+          faceData.uvs,
+        ),
+        mirrored:
+          Boolean(faceData.mirrored),
+      }
+
+      let assets: SavedAsset[] = []
+
+      try {
+        const existing =
+          localStorage.getItem(
+            ASSET_STORAGE_KEY,
+          )
+
+        if (existing) {
+          assets =
+            JSON.parse(existing)
+        }
+      } catch {
+        assets = []
+      }
+
+      assets.push(asset)
+
+      try {
+        localStorage.setItem(
+          ASSET_STORAGE_KEY,
+          JSON.stringify(assets),
+        )
+
+        setAssetSaved(true)
+        setStatus('ASSET SAVED')
+        setSubStatus(
+          'STATE: LOCAL FACE LIBRARY',
+        )
+      } catch {
+        setError(
+          'The asset is too large for browser storage. Try a smaller source image.',
+        )
+      }
+    }, [
+      faceData,
+      sourceName,
     ])
 
   const reset =
     useCallback(() => {
       stopWebcam()
+      clearObjectUrl()
 
       setFaceData(null)
       setImageSrc(null)
+      sourceDataUrlRef.current = null
+      setAssetSaved(false)
       setError(null)
+      setSourceName('Untitled Face')
+      setSourceTimestamp('')
 
       setStatus(
         'AWAITING NEURAL INPUT',
       )
 
-      setSubStatus(
-        'STATE: IDLE',
-      )
-    }, [stopWebcam])
+      setSubStatus('STATE: IDLE')
+    }, [
+      clearObjectUrl,
+      stopWebcam,
+    ])
+
+  const modelReadyText =
+    modelReady
+      ? 'VISION CORE ONLINE'
+      : 'LOADING VISION CORE'
+
+  const landmarkCount =
+    faceData
+      ? faceData.positions.length / 3
+      : undefined
+
+  const sourcePanel =
+    mode !== 'idle' &&
+    (imageSrc || mode === 'webcam')
+
+  const modelLabel =
+    faceData
+      ? 'RECONSTRUCTED HEAD'
+      : 'BLANK HEAD'
+
+  const controlHint =
+    'DRAG ROTATE · PINCH / WHEEL ZOOM'
+
+  const timestampLabel =
+    useMemo(
+      () =>
+        sourceTimestamp ||
+        'Waiting for source',
+      [sourceTimestamp],
+    )
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#070708] text-white">
       <BootLoader />
-
       <RotateOverlay />
 
-      <div className="absolute inset-0 z-0 bg-[radial-gradient(circle_at_50%_45%,rgba(120,95,255,.12),transparent_34%),radial-gradient(circle_at_20%_20%,rgba(140,255,106,.06),transparent_28%)]" />
+      <div className="absolute inset-0 z-0 bg-[radial-gradient(circle_at_65%_45%,rgba(120,95,255,.14),transparent_32%),radial-gradient(circle_at_18%_30%,rgba(140,255,106,.07),transparent_26%)]" />
 
       <div className="absolute inset-0 z-0">
         {mode === 'webcam' && (
           <video
             ref={videoRef}
-            className="h-full w-full object-cover opacity-60"
+            className="pointer-events-none h-full w-full object-cover opacity-[0.14]"
             style={{
               transform:
                 'scaleX(-1)',
@@ -689,54 +925,51 @@ function App() {
           />
         )}
 
-        {mode === 'upload' &&
-          imageSrc && (
-            <img
-              src={imageSrc}
-              alt="Uploaded face source"
-              className="h-full w-full object-cover opacity-55"
-            />
-          )}
-
-        <div className="absolute inset-0 bg-[#070708]/25" />
-
-        <div className="scanlines absolute inset-0 opacity-30" />
+        <div className="absolute inset-0 bg-[#070708]/65" />
+        <div className="scanlines absolute inset-0 opacity-25" />
       </div>
 
       <Canvas
         className="!absolute inset-0 z-10"
-        camera={{
-          position: [0, 0, 5],
-          fov: 42,
-        }}
-        dpr={[1, 1.5]}
         gl={{
           antialias: true,
           alpha: true,
           powerPreference:
             'high-performance',
         }}
+        dpr={[1, 1.5]}
       >
         <Suspense fallback={null}>
-          <ambientLight
-            intensity={1.1}
+          <PerspectiveCamera
+            makeDefault
+            position={[0, 0, 5.2]}
+            fov={42}
           />
+
+          <ambientLight intensity={1.15} />
 
           <directionalLight
             position={[2, 3, 4]}
-            intensity={1.7}
+            intensity={1.65}
           />
 
           <pointLight
-            position={[-2, 0, 2]}
-            intensity={1.3}
+            position={[-2.5, 0.5, 2]}
+            intensity={1.35}
             color="#8cff6a"
           />
 
           <pointLight
-            position={[2, 1, 1]}
-            intensity={1.1}
+            position={[2.2, 1, 1.5]}
+            intensity={1.15}
             color="#9b7cff"
+          />
+
+          <BlankHead
+            visible={
+              showBlankHead ||
+              !faceData
+            }
           />
 
           {faceData && (
@@ -747,12 +980,32 @@ function App() {
                   ? imageSrc
                   : null
               }
+              showWireframe={
+                showWireframe
+              }
+              showPoints={
+                showPoints
+              }
+              reconstructionKey={`${assetVersion}-${mode}`}
             />
           )}
+
+          <OrbitControls
+            makeDefault
+            enableDamping
+            dampingFactor={0.075}
+            minDistance={2.4}
+            maxDistance={8}
+            rotateSpeed={0.72}
+            zoomSpeed={0.8}
+            panSpeed={0.35}
+            enablePan
+            screenSpacePanning
+          />
         </Suspense>
       </Canvas>
 
-      <div className="pointer-events-none absolute inset-0 z-20 flex flex-col justify-between p-4 sm:p-6">
+      <div className="pointer-events-none absolute inset-0 z-20 flex flex-col justify-between p-3 sm:p-5">
         <header className="flex items-start justify-between gap-3">
           <div className="glass-panel border-white/10 px-4 py-3 shadow-glass">
             <div className="flex items-center gap-3">
@@ -764,26 +1017,152 @@ function App() {
                 </h1>
 
                 <p className="mt-1 font-mono text-[8px] uppercase tracking-[0.24em] text-zinc-500">
-                  478-point browser reconstruction
+                  3D facial surface reconstruction
                 </p>
               </div>
             </div>
           </div>
 
-          <div className="flex gap-2">
-            {mode !== 'idle' && (
-              <HudButton
-                onClick={reset}
-                variant="danger"
-                title="Reset scanner"
-              >
-                RESET
-              </HudButton>
-            )}
+          <div className="glass-panel hidden border-white/10 px-3 py-2 sm:block">
+            <p className="font-mono text-[8px] uppercase tracking-[0.18em] text-zinc-500">
+              {modelReadyText}
+            </p>
           </div>
         </header>
 
-        <section className="mx-auto flex w-full max-w-3xl flex-col items-center gap-4">
+        <section className="mx-auto flex w-full max-w-6xl flex-1 items-center justify-center py-6">
+          <div className="grid w-full grid-cols-1 gap-3 lg:grid-cols-[minmax(230px,0.78fr)_minmax(360px,1.4fr)]">
+            <AnimatePresence mode="wait">
+              {sourcePanel ? (
+                <motion.aside
+                  key="source-panel"
+                  initial={{
+                    opacity: 0,
+                    x: -18,
+                  }}
+                  animate={{
+                    opacity: 1,
+                    x: 0,
+                  }}
+                  className="glass-panel pointer-events-auto flex min-h-[260px] flex-col border-white/10 p-3 shadow-glass"
+                >
+                  <div className="mb-3 flex items-center justify-between">
+                    <div>
+                      <p className="font-mono text-[9px] uppercase tracking-[0.26em] text-accent">
+                        SOURCE
+                      </p>
+
+                      <p className="mt-1 font-mono text-[8px] uppercase tracking-[0.16em] text-zinc-500">
+                        Persistent reference
+                      </p>
+                    </div>
+
+                    <span className="font-mono text-[8px] text-zinc-600">
+                      {mode === 'webcam'
+                        ? 'LIVE'
+                        : 'IMAGE'}
+                    </span>
+                  </div>
+
+                  <div className="relative min-h-0 flex-1 overflow-hidden rounded-xl border border-white/10 bg-black/30">
+                    {mode ===
+                      'upload' &&
+                      imageSrc && (
+                        <img
+                          src={imageSrc}
+                          alt="Uploaded face source"
+                          className="h-full min-h-[230px] w-full object-contain"
+                        />
+                      )}
+
+                    {mode ===
+                      'webcam' && (
+                      <video
+                        ref={
+                          videoRef
+                        }
+                        className="h-full min-h-[230px] w-full object-cover"
+                        style={{
+                          transform:
+                            'scaleX(-1)',
+                        }}
+                        playsInline
+                        muted
+                        autoPlay
+                      />
+                    )}
+
+                    <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent" />
+
+                    <div className="absolute bottom-2 left-2 right-2 flex items-end justify-between gap-2">
+                      <span className="rounded-lg border border-white/10 bg-black/55 px-2 py-1 font-mono text-[8px] uppercase tracking-[0.12em] text-zinc-300 backdrop-blur-md">
+                        {landmarkCount
+                          ? `${landmarkCount} LANDMARKS`
+                          : 'ANALYZING'}
+                      </span>
+
+                      <span className="rounded-lg border border-white/10 bg-black/55 px-2 py-1 font-mono text-[8px] text-zinc-500 backdrop-blur-md">
+                        {timestampLabel}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="mt-3">
+                    <label className="font-mono text-[8px] uppercase tracking-[0.18em] text-zinc-600">
+                      Asset name
+                    </label>
+
+                    <input
+                      value={sourceName}
+                      onChange={(event) => {
+                        setSourceName(
+                          event.target.value,
+                        )
+                        setAssetSaved(
+                          false,
+                        )
+                      }}
+                      className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-[10px] text-white outline-none transition focus:border-accent/40"
+                      maxLength={80}
+                    />
+                  </div>
+                </motion.aside>
+              ) : (
+                <div className="hidden lg:block" />
+              )}
+            </AnimatePresence>
+
+            <div className="glass-panel relative min-h-[440px] overflow-hidden border-white/10 shadow-glass lg:min-h-[560px]">
+              <div className="pointer-events-none absolute left-4 top-4 z-10">
+                <p className="font-mono text-[9px] uppercase tracking-[0.26em] text-accent">
+                  3D RECONSTRUCTION
+                </p>
+
+                <p className="mt-1 font-mono text-[8px] uppercase tracking-[0.16em] text-zinc-600">
+                  {modelLabel}
+                </p>
+              </div>
+
+              <div className="pointer-events-none absolute right-4 top-4 z-10 text-right">
+                <p className="font-mono text-[8px] uppercase tracking-[0.15em] text-zinc-600">
+                  {controlHint}
+                </p>
+              </div>
+
+              <div className="pointer-events-none absolute bottom-4 left-4 z-10 flex gap-2">
+                <span className="rounded-md border border-white/10 bg-black/30 px-2 py-1 font-mono text-[7px] uppercase tracking-[0.14em] text-zinc-600 backdrop-blur-md">
+                  X/Y/Z FACE SPACE
+                </span>
+
+                <span className="rounded-md border border-white/10 bg-black/30 px-2 py-1 font-mono text-[7px] uppercase tracking-[0.14em] text-zinc-600 backdrop-blur-md">
+                  TRIANGULATED
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-2">
           <AnimatePresence mode="wait">
             <motion.div
               key={`${status}-${subStatus}`}
@@ -799,85 +1178,143 @@ function App() {
                 opacity: 0,
                 y: -12,
               }}
+              className="mx-auto"
             >
               <StatusBox
                 status={status}
                 subStatus={subStatus}
                 landmarks={
-                  faceData?.positions
-                    .length
-                    ? faceData.positions
-                        .length / 3
-                    : undefined
+                  landmarkCount
                 }
               />
             </motion.div>
           </AnimatePresence>
 
           {error && (
-            <div className="glass-panel max-w-xl border-red-400/20 px-4 py-3 text-center font-mono text-[9px] uppercase tracking-[0.16em] text-red-200">
+            <div className="glass-panel mx-auto max-w-xl border-red-400/20 px-4 py-3 text-center font-mono text-[9px] uppercase tracking-[0.16em] text-red-200">
               {error}
             </div>
           )}
 
-          {mode === 'idle' && (
-            <motion.div
-              initial={{
-                opacity: 0,
-                y: 20,
-              }}
-              animate={{
-                opacity: 1,
-                y: 0,
-              }}
-              transition={{
-                delay: 1.7,
-              }}
-              className="pointer-events-auto flex flex-col gap-2 sm:flex-row"
-            >
-              <input
-                ref={inputRef}
-                type="file"
-                accept="image/*"
-                onChange={
-                  handleImageUpload
-                }
-                className="hidden"
-              />
+          <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-2">
+            {mode === 'idle' && (
+              <>
+                <input
+                  ref={inputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={
+                    handleImageUpload
+                  }
+                  className="hidden"
+                />
 
-              <HudButton
-                onClick={() =>
-                  inputRef.current?.click()
-                }
-              >
-                UPLOAD IMAGE
-              </HudButton>
+                <HudButton
+                  onClick={() =>
+                    inputRef.current?.click()
+                  }
+                >
+                  UPLOAD IMAGE
+                </HudButton>
 
-              <HudButton
-                onClick={startWebcam}
-                variant="accent"
-              >
-                LIVE WEBCAM
-              </HudButton>
-            </motion.div>
-          )}
-        </section>
+                <HudButton
+                  onClick={startWebcam}
+                  variant="accent"
+                >
+                  LIVE WEBCAM
+                </HudButton>
+              </>
+            )}
 
-        <footer className="flex items-end justify-between gap-4">
-          <div className="glass-panel border-white/10 px-3 py-2 font-mono text-[8px] uppercase tracking-[0.2em] text-zinc-500">
-            MediaPipe · Three.js · React
+            {faceData && (
+              <>
+                <HudButton
+                  onClick={() =>
+                    setShowBlankHead(
+                      (value) =>
+                        !value,
+                    )
+                  }
+                  title="Toggle blank head"
+                >
+                  {showBlankHead
+                    ? 'HEAD ON'
+                    : 'HEAD OFF'}
+                </HudButton>
+
+                <HudButton
+                  onClick={() =>
+                    setShowWireframe(
+                      (value) =>
+                        !value,
+                    )
+                  }
+                  title="Toggle triangulation"
+                >
+                  {showWireframe
+                    ? 'TRIANGLES ON'
+                    : 'TRIANGLES OFF'}
+                </HudButton>
+
+                <HudButton
+                  onClick={() =>
+                    setShowPoints(
+                      (value) =>
+                        !value,
+                    )
+                  }
+                  title="Toggle landmarks"
+                >
+                  {showPoints
+                    ? 'POINTS ON'
+                    : 'POINTS OFF'}
+                </HudButton>
+
+                {mode ===
+                  'upload' && (
+                  <HudButton
+                    onClick={
+                      saveAsset
+                    }
+                    variant="accent"
+                    disabled={
+                      assetSaved
+                    }
+                  >
+                    {assetSaved
+                      ? 'ASSET SAVED'
+                      : 'SAVE ASSET'}
+                  </HudButton>
+                )}
+
+                <HudButton
+                  onClick={reset}
+                  variant="danger"
+                >
+                  RESET
+                </HudButton>
+              </>
+            )}
           </div>
 
-          <div className="text-right font-mono text-[8px] uppercase tracking-[0.2em] text-zinc-600">
-            <div>
-              LOCAL VISION PIPELINE
+          <footer className="flex items-center justify-between gap-4 py-1">
+            <div className="font-mono text-[8px] uppercase tracking-[0.2em] text-zinc-600">
+              MediaPipe · Three.js · React · Local Asset Store
             </div>
 
-            <div className="mt-1">
-              TEJAS / NEURAL LAB
+            <div className="text-right font-mono text-[8px] uppercase tracking-[0.2em] text-zinc-600">
+              <div>
+                {mode === 'webcam'
+                  ? 'MIRROR-SAFE LIVE PIPELINE'
+                  : 'SOURCE-LOCKED RECONSTRUCTION'}
+              </div>
+
+              <div className="mt-1">
+                TEJAS / NEURAL LAB
+              </div>
             </div>
-          </div>
-        </footer>
+          </footer>
+        </div>
       </div>
     </main>
   )

@@ -39,6 +39,10 @@ button {
   -webkit-tap-highlight-color: transparent;
 }
 
+input::selection {
+  background: rgba(140, 255, 106, 0.25);
+}
+
 .glass-panel {
   border-radius: 16px;
   border-width: 1px;
@@ -46,12 +50,12 @@ button {
   background:
     linear-gradient(
       135deg,
-      rgba(22, 22, 25, 0.72),
-      rgba(8, 8, 10, 0.5)
+      rgba(22, 22, 25, 0.78),
+      rgba(8, 8, 10, 0.56)
     );
 
   box-shadow:
-    0 24px 80px rgba(0, 0, 0, 0.35),
+    0 24px 80px rgba(0, 0, 0, 0.38),
     inset 0 1px 0 rgba(255, 255, 255, 0.045);
 
   backdrop-filter: blur(22px) saturate(125%);
