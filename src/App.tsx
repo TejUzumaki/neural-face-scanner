@@ -1,1323 +1,342 @@
-import {
-  Suspense,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ChangeEvent,
-} from 'react'
+import { Suspense, useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { Canvas } from '@react-three/fiber'
-import {
-  OrbitControls,
-  PerspectiveCamera,
-} from '@react-three/drei'
-import {
-  AnimatePresence,
-  motion,
-} from 'framer-motion'
+import { OrbitControls, PerspectiveCamera } from '@react-three/drei'
 import * as vision from '@mediapipe/tasks-vision'
+import FaceMesh3D, { type FaceData } from './components/FaceMesh3D'
 
-import BlankHead from './components/BlankHead'
-import FaceMesh3D, {
-  type FaceData,
-} from './components/FaceMesh3D'
+type Mode = 'idle' | 'upload' | 'webcam'
+const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm'
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
+const STORAGE_KEY = 'neural-face-scanner-assets-v2'
 
-import {
-  BootLoader,
-  HudButton,
-  RotateOverlay,
-  StatusBox,
-} from './components/ui/Overlay'
-
-type Mode =
-  | 'idle'
-  | 'upload'
-  | 'webcam'
-
-interface SavedAsset {
-  id: string
-  name: string
-  createdAt: string
-  sourceImage: string
-  positions: number[]
-  uvs: number[]
-  mirrored: boolean
-}
-
-const WASM_URL =
-  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm'
-
-const MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
-
-const ASSET_STORAGE_KEY =
-  'neural-face-scanner-assets-v1'
-
-function normalizeLandmarks(
-  landmarks: vision.NormalizedLandmark[],
-  mirrored: boolean,
-): FaceData {
-  const positions = new Float32Array(
-    landmarks.length * 3,
-  )
-
-  const uvs = new Float32Array(
-    landmarks.length * 2,
-  )
-
+function toFaceData(landmarks: vision.NormalizedLandmark[], mirrored = false): FaceData {
+  const positions = new Float32Array(landmarks.length * 3)
+  const uvs = new Float32Array(landmarks.length * 2)
   const nose = landmarks[1] ?? landmarks[4]
-
-  const noseX = mirrored
-    ? 1 - nose.x
-    : nose.x
-
-  const noseY = nose.y
-  const noseZ = nose.z
-
-  const leftEye =
-    landmarks[33]
-
-  const rightEye =
-    landmarks[263]
-
-  const leftX = mirrored
-    ? 1 - leftEye.x
-    : leftEye.x
-
-  const rightX = mirrored
-    ? 1 - rightEye.x
-    : rightEye.x
-
-  const eyeDistance = Math.max(
-    0.08,
-    Math.abs(rightX - leftX),
-  )
-
-  const scale =
-    1.62 / eyeDistance
-
-  for (
-    let i = 0;
-    i < landmarks.length;
-    i += 1
-  ) {
-    const landmark = landmarks[i]
-
-    const xNorm =
-      (mirrored
-        ? 1 - landmark.x
-        : landmark.x) - noseX
-
-    const yNorm =
-      landmark.y - noseY
-
-    const zNorm =
-      landmark.z - noseZ
-
-    positions[i * 3] =
-      xNorm * scale
-
-    positions[i * 3 + 1] =
-      -yNorm * scale
-
-    positions[i * 3 + 2] =
-      -zNorm * scale * 1.35
-
-    const imageX = mirrored
-      ? 1 - landmark.x
-      : landmark.x
-
-    uvs[i * 2] = imageX
-    uvs[i * 2 + 1] =
-      1 - landmark.y
+  const eyeA = landmarks[33]
+  const eyeB = landmarks[263]
+  const xA = mirrored ? 1 - eyeA.x : eyeA.x
+  const xB = mirrored ? 1 - eyeB.x : eyeB.x
+  const scale = 1.62 / Math.max(0.08, Math.abs(xB - xA))
+  const noseX = mirrored ? 1 - nose.x : nose.x
+  for (let i = 0; i < landmarks.length; i++) {
+    const p = landmarks[i]
+    const x = mirrored ? 1 - p.x : p.x
+    positions[i * 3] = (x - noseX) * scale
+    positions[i * 3 + 1] = -(p.y - nose.y) * scale
+    positions[i * 3 + 2] = -(p.z - nose.z) * scale * 1.35
+    uvs[i * 2] = x
+    uvs[i * 2 + 1] = 1 - p.y
   }
-
-  return {
-    positions,
-    uvs,
-    mirrored,
-  }
+  return { positions, uvs, mirrored }
 }
 
-function readFileAsDataUrl(
-  file: File,
-): Promise<string> {
-  return new Promise(
-    (resolve, reject) => {
-      const reader = new FileReader()
-
-      reader.onload = () => {
-        if (
-          typeof reader.result ===
-          'string'
-        ) {
-          resolve(reader.result)
-        } else {
-          reject(
-            new Error(
-              'Could not create image data.',
-            ),
-          )
-        }
-      }
-
-      reader.onerror = () =>
-        reject(
-          reader.error ??
-            new Error(
-              'Could not read image.',
-            ),
-        )
-
-      reader.readAsDataURL(file)
-    },
-  )
+function loadImage(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const image = new Image()
+    image.onload = () => { URL.revokeObjectURL(url); resolve(image) }
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image could not be decoded.')) }
+    image.src = url
+  })
 }
 
-function App() {
-  const [mode, setMode] =
-    useState<Mode>('idle')
+export default function App() {
+  const [mode, setMode] = useState<Mode>('idle')
+  const [face, setFace] = useState<FaceData | null>(null)
+  const [imageUrl, setImageUrl] = useState<string | null>(null)
+  const [name, setName] = useState('Untitled scan')
+  const [status, setStatus] = useState('Ready for a face image')
+  const [error, setError] = useState('')
+  const [modelState, setModelState] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [wireframe, setWireframe] = useState(true)
+  const [points, setPoints] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [cameraReady, setCameraReady] = useState(false)
+  const inputRef = useRef<HTMLInputElement>(null)
+  // Keep the video node mounted permanently. This avoids racing React's render
+  // cycle when getUserMedia resolves immediately after the camera button tap.
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const landmarkerRef = useRef<vision.FaceLandmarker | null>(null)
+  const frameRef = useRef<number | null>(null)
+  const lastVideoTime = useRef(-1)
+  const lastDetectionAt = useRef(0)
+  const modeRef = useRef<Mode>('idle')
 
-  const [faceData, setFaceData] =
-    useState<FaceData | null>(null)
-
-  const [imageSrc, setImageSrc] =
-    useState<string | null>(null)
-
-  const [sourceName, setSourceName] =
-    useState('Untitled Face')
-
-  const [assetSaved, setAssetSaved] =
-    useState(false)
-
-  const [status, setStatus] =
-    useState('AWAITING NEURAL INPUT')
-
-  const [subStatus, setSubStatus] =
-    useState('STATE: IDLE')
-
-  const [modelReady, setModelReady] =
-    useState(false)
-
-  const [error, setError] =
-    useState<string | null>(null)
-
-  const [showWireframe, setShowWireframe] =
-    useState(true)
-
-  const [showPoints, setShowPoints] =
-    useState(false)
-
-  const [showBlankHead, setShowBlankHead] =
-    useState(true)
-
-  const [sourceTimestamp, setSourceTimestamp] =
-    useState('')
-
-  const [assetVersion, setAssetVersion] =
-    useState(0)
-
-  const inputRef =
-    useRef<HTMLInputElement>(null)
-
-  const videoRef =
-    useRef<HTMLVideoElement | null>(null)
-
-  const streamRef =
-    useRef<MediaStream | null>(null)
-
-  const landmarkerRef =
-    useRef<vision.FaceLandmarker | null>(
-      null,
-    )
-
-  const modeRef =
-    useRef<Mode>('idle')
-
-  const rafRef =
-    useRef<number | null>(null)
-
-  const lastVideoTimeRef =
-    useRef(-1)
-
-  const objectUrlRef =
-    useRef<string | null>(null)
-
-  const sourceDataUrlRef =
-    useRef<string | null>(null)
-
-  const setScannerMode =
-    useCallback((next: Mode) => {
-      modeRef.current = next
-      setMode(next)
-    }, [])
-
-  const stopAnimationLoop =
-    useCallback(() => {
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(
-          rafRef.current,
-        )
-
-        rafRef.current = null
-      }
-    }, [])
-
-  const stopCameraTracks =
-    useCallback(() => {
-      streamRef.current
-        ?.getTracks()
-        .forEach((track) => {
-          track.stop()
-        })
-
-      streamRef.current = null
-      lastVideoTimeRef.current = -1
-    }, [])
-
-  const clearObjectUrl =
-    useCallback(() => {
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(
-          objectUrlRef.current,
-        )
-
-        objectUrlRef.current = null
-      }
-    }, [])
-
-  const stopWebcam =
-    useCallback(() => {
-      stopAnimationLoop()
-      stopCameraTracks()
-
-      if (
-        modeRef.current ===
-        'webcam'
-      ) {
-        setScannerMode('idle')
-      }
-    }, [
-      setScannerMode,
-      stopAnimationLoop,
-      stopCameraTracks,
-    ])
+  const stopCamera = useCallback(() => {
+    if (frameRef.current !== null) cancelAnimationFrame(frameRef.current)
+    frameRef.current = null
+    streamRef.current?.getTracks().forEach(track => track.stop())
+    streamRef.current = null
+    if (videoRef.current) {
+      videoRef.current.pause()
+      videoRef.current.srcObject = null
+    }
+    setCameraReady(false)
+    if (modeRef.current === 'webcam') {
+      modeRef.current = 'idle'
+      setMode('idle')
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
-
-    const initialize = async () => {
+    async function init() {
       try {
-        const fileset =
-          await vision.FilesetResolver.forVisionTasks(
-            WASM_URL,
-          )
-
-        const landmarker =
-          await vision.FaceLandmarker.createFromOptions(
-            fileset,
-            {
-              baseOptions: {
-                modelAssetPath:
-                  MODEL_URL,
-                delegate: 'GPU',
-              },
-
-              runningMode: 'IMAGE',
-
-              numFaces: 1,
-
-              minFaceDetectionConfidence:
-                0.5,
-
-              minFacePresenceConfidence:
-                0.5,
-
-              minTrackingConfidence:
-                0.5,
-            },
-          )
-
-        if (cancelled) {
-          landmarker.close()
-          return
+        const fileset = await vision.FilesetResolver.forVisionTasks(WASM_URL)
+        let landmarker: vision.FaceLandmarker
+        try {
+          landmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+            runningMode: 'IMAGE', numFaces: 1,
+            minFaceDetectionConfidence: 0.5,
+            minFacePresenceConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+          })
+        } catch {
+          landmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
+            runningMode: 'IMAGE', numFaces: 1,
+          })
         }
-
-        landmarkerRef.current =
-          landmarker
-
-        setModelReady(true)
-      } catch (err) {
-        console.error(err)
-
-        setError(
-          'Vision core failed to initialize. Check your network connection and reload.',
-        )
-
-        setStatus(
-          'VISION CORE ERROR',
-        )
-
-        setSubStatus(
-          'STATE: ERROR',
-        )
+        if (cancelled) { landmarker.close(); return }
+        landmarkerRef.current = landmarker
+        setModelState('ready')
+        setStatus('Vision engine ready · waiting for input')
+      } catch (e) {
+        console.error(e)
+        if (!cancelled) {
+          setModelState('error')
+          setError('Face detection could not load. Check your connection, then reload. The model and WASM files are downloaded from their hosted sources.')
+          setStatus('Vision engine unavailable')
+        }
       }
     }
-
-    void initialize()
-
+    void init()
     return () => {
       cancelled = true
-
-      stopAnimationLoop()
-      stopCameraTracks()
-
+      if (frameRef.current !== null) cancelAnimationFrame(frameRef.current)
+      streamRef.current?.getTracks().forEach(t => t.stop())
       landmarkerRef.current?.close()
-      landmarkerRef.current = null
-
-      clearObjectUrl()
     }
-  }, [
-    clearObjectUrl,
-    stopAnimationLoop,
-    stopCameraTracks,
-  ])
+  }, [])
 
-  const switchRunningMode =
-    useCallback(
-      async (
-        runningMode:
-          | 'IMAGE'
-          | 'VIDEO',
-      ) => {
-        if (!landmarkerRef.current) {
-          return
-        }
+  const processImage = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!file.type.startsWith('image/')) { setError('Choose a valid image file.'); return }
+    if (!landmarkerRef.current) { setError('Face detection is still loading. Try again in a moment.'); return }
+    stopCamera()
+    setError('')
+    setStatus('Analysing portrait…')
+    setSaved(false)
+    try {
+      await landmarkerRef.current.setOptions({ runningMode: 'IMAGE' })
+      const image = await loadImage(file)
+      const result = landmarkerRef.current.detect(image)
+      const landmarks = result.faceLandmarks?.[0]
+      if (!landmarks?.length) {
+        setError('No face detected. Use a clear, front-facing photograph with the full face visible.')
+        setStatus('No face detected')
+        return
+      }
+      const canvas = document.createElement('canvas')
+      const maxSide = 1600
+      const ratio = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight))
+      canvas.width = Math.round(image.naturalWidth * ratio)
+      canvas.height = Math.round(image.naturalHeight * ratio)
+      canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height)
+      setImageUrl(canvas.toDataURL('image/jpeg', 0.9))
+      setFace(toFaceData(landmarks))
+      setName(file.name.replace(/\.[^.]+$/, '') || 'Untitled scan')
+      modeRef.current = 'upload'
+      setMode('upload')
+      setStatus(`Surface generated · ${landmarks.length} landmarks`)
+    } catch (e) {
+      console.error(e)
+      setError(e instanceof Error ? e.message : 'Image processing failed.')
+      setStatus('Processing failed')
+    }
+  }
 
-        await landmarkerRef.current.setOptions(
-          {
-            runningMode,
-          },
-        )
-      },
-      [],
-    )
-
-  const handleImageUpload =
-    useCallback(
-      async (
-        event: ChangeEvent<HTMLInputElement>,
-      ) => {
-        const file =
-          event.target.files?.[0]
-
-        event.target.value = ''
-
-        if (!file) return
-
-        if (
-          !landmarkerRef.current ||
-          !modelReady
-        ) {
-          setStatus(
-            'VISION CORE LOADING',
-          )
-
-          setSubStatus(
-            'STATE: WAIT',
-          )
-
-          return
-        }
-
-        stopWebcam()
-        clearObjectUrl()
-
-        setError(null)
-        setAssetSaved(false)
-        setScannerMode('upload')
-        setStatus('ANALYZING IMAGE')
-        setSubStatus(
-          'STATE: LANDMARK EXTRACTION',
-        )
-        setFaceData(null)
-
-        try {
-          await switchRunningMode(
-            'IMAGE',
-          )
-
-          const objectUrl =
-            URL.createObjectURL(file)
-
-          objectUrlRef.current =
-            objectUrl
-
-          const dataUrl =
-            await readFileAsDataUrl(
-              file,
-            )
-
-          sourceDataUrlRef.current =
-            dataUrl
-
-          const image =
-            new Image()
-
-          image.src = objectUrl
-
-          await image.decode()
-
-          const result =
-            landmarkerRef.current.detect(
-              image,
-            )
-
-          const landmarks =
-            result.faceLandmarks?.[0]
-
-          if (!landmarks?.length) {
-            setStatus(
-              'NO FACE DETECTED',
-            )
-
-            setSubStatus(
-              'STATE: TRY ANOTHER IMAGE',
-            )
-
-            return
-          }
-
-          const data =
-            normalizeLandmarks(
-              landmarks,
-              false,
-            )
-
-          setImageSrc(dataUrl)
-          setFaceData(data)
-
-          setSourceName(
-            file.name.replace(
-              /\.[^/.]+$/,
-              '',
-            ) || 'Untitled Face',
-          )
-
-          setSourceTimestamp(
-            new Date().toLocaleString(
-              undefined,
-              {
-                dateStyle: 'medium',
-                timeStyle: 'short',
-              },
-            ),
-          )
-
-          setAssetVersion(
-            (value) => value + 1,
-          )
-
-          setStatus(
-            'TRIANGULATING FACE',
-          )
-
-          setSubStatus(
-            'STATE: 478-POINT SURFACE',
-          )
-
-          window.setTimeout(() => {
-            if (
-              modeRef.current ===
-              'upload'
-            ) {
-              setStatus(
-                '3D RECONSTRUCTION READY',
-              )
-
-              setSubStatus(
-                'STATE: INSPECT MODEL',
-              )
+  const startCamera = async () => {
+    if (!landmarkerRef.current) { setError('The vision engine is not ready yet. Wait until its status says READY.'); return }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('Camera access is unavailable. Open this app on localhost or HTTPS in a supported browser, then check camera permission.')
+      return
+    }
+    stopCamera()
+    setError('')
+    setFace(null)
+    setImageUrl(null)
+    setStatus('Waiting for camera permission…')
+    try {
+      await landmarkerRef.current.setOptions({ runningMode: 'VIDEO' })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } },
+      })
+      streamRef.current = stream
+      modeRef.current = 'webcam'
+      setMode('webcam')
+      const video = videoRef.current
+      if (!video) throw new Error('Camera preview element is unavailable. Reload the page and try again.')
+      video.srcObject = stream
+      video.muted = true
+      video.playsInline = true
+      await video.play()
+      setCameraReady(true)
+      setStatus('Camera active · looking for a face')
+      lastVideoTime.current = -1
+      lastDetectionAt.current = 0
+      const scan = () => {
+        if (modeRef.current !== 'webcam' || !videoRef.current || !landmarkerRef.current) return
+        const currentVideo = videoRef.current
+        const now = performance.now()
+        if (currentVideo.readyState >= 2 && currentVideo.currentTime !== lastVideoTime.current && now - lastDetectionAt.current >= 125) {
+          lastVideoTime.current = currentVideo.currentTime
+          lastDetectionAt.current = now
+          try {
+            const result = landmarkerRef.current.detectForVideo(currentVideo, now)
+            const landmarks = result.faceLandmarks?.[0]
+            if (landmarks?.length) {
+              setFace(toFaceData(landmarks, true))
+              setStatus(`Live tracking · ${landmarks.length} landmarks`)
+            } else {
+              setFace(null)
+              setStatus('Camera active · move your face into view')
             }
-          }, 1600)
-        } catch (err) {
-          console.error(err)
-
-          setStatus(
-            'IMAGE PROCESSING ERROR',
-          )
-
-          setSubStatus(
-            'STATE: ERROR',
-          )
-
-          setError(
-            'The image could not be decoded or processed.',
-          )
+          } catch (e) { console.warn('Frame detection failed', e) }
         }
-      },
-      [
-        clearObjectUrl,
-        modelReady,
-        setScannerMode,
-        stopWebcam,
-        switchRunningMode,
-      ],
-    )
-
-  const scanVideoFrame =
-    useCallback(() => {
-      const video =
-        videoRef.current
-
-      const landmarker =
-        landmarkerRef.current
-
-      if (
-        !video ||
-        !landmarker ||
-        modeRef.current !==
-          'webcam'
-      ) {
-        return
+        frameRef.current = requestAnimationFrame(scan)
       }
+      frameRef.current = requestAnimationFrame(scan)
+    } catch (e) {
+      console.error(e)
+      stopCamera()
+      const message = e instanceof Error ? e.message : 'Camera access failed.'
+      setError(message.includes('Permission') || message.includes('denied')
+        ? 'Camera permission was denied. Allow camera access for this site in Chrome site settings, then try again.'
+        : message)
+      setStatus('Camera unavailable')
+    }
+  }
 
-      if (
-        video.readyState >= 2 &&
-        video.currentTime !==
-          lastVideoTimeRef.current
-      ) {
-        try {
-          const result =
-            landmarker.detectForVideo(
-              video,
-              performance.now(),
-            )
+  const saveScan = () => {
+    if (!face || !imageUrl || mode !== 'upload') { setError('Save is available for completed photo scans.'); return }
+    try {
+      const existing = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]') as unknown[]
+      existing.push({ id: `${Date.now()}`, name: name.trim() || 'Untitled scan', createdAt: new Date().toISOString(), sourceImage: imageUrl, positions: Array.from(face.positions), uvs: Array.from(face.uvs) })
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(existing))
+      setSaved(true)
+      setError('')
+      setStatus('Scan saved in this browser')
+    } catch {
+      setError('Browser storage is full. Use a smaller image or clear saved scans in this browser.')
+    }
+  }
 
-          lastVideoTimeRef.current =
-            video.currentTime
-
-          const landmarks =
-            result.faceLandmarks?.[0]
-
-          if (landmarks?.length) {
-            const data =
-              normalizeLandmarks(
-                landmarks,
-                true,
-              )
-
-            setFaceData(data)
-
-            setStatus(
-              'LIVE NEURAL TRACKING',
-            )
-
-            setSubStatus(
-              'STATE: MIRRORED COORDINATES',
-            )
-          } else {
-            setFaceData(null)
-
-            setStatus(
-              'SEARCHING FOR FACE',
-            )
-
-            setSubStatus(
-              'STATE: NO LANDMARKS',
-            )
-          }
-        } catch (err) {
-          console.error(err)
-
-          setStatus(
-            'TRACKING ERROR',
-          )
-
-          setSubStatus(
-            'STATE: RETRYING',
-          )
-        }
-      }
-
-      rafRef.current =
-        requestAnimationFrame(
-          scanVideoFrame,
-        )
-    }, [])
-
-  const startWebcam =
-    useCallback(async () => {
-      if (
-        !modelReady ||
-        !landmarkerRef.current
-      ) {
-        setStatus(
-          'VISION CORE LOADING',
-        )
-
-        setSubStatus(
-          'STATE: WAIT',
-        )
-
-        return
-      }
-
-      if (
-        !navigator.mediaDevices?.getUserMedia
-      ) {
-        setStatus(
-          'CAMERA UNAVAILABLE',
-        )
-
-        setSubStatus(
-          'STATE: HTTPS REQUIRED',
-        )
-
-        return
-      }
-
-      stopAnimationLoop()
-      stopCameraTracks()
-      clearObjectUrl()
-
-      setError(null)
-      setAssetSaved(false)
-      setScannerMode('webcam')
-      setStatus('REQUESTING CAMERA')
-      setSubStatus(
-        'STATE: PERMISSION',
-      )
-
-      setFaceData(null)
-      setImageSrc(null)
-      sourceDataUrlRef.current = null
-
-      try {
-        await switchRunningMode(
-          'VIDEO',
-        )
-
-        const stream =
-          await navigator.mediaDevices.getUserMedia(
-            {
-              audio: false,
-              video: {
-                facingMode: {
-                  ideal: 'user',
-                },
-                width: {
-                  ideal: 1280,
-                },
-                height: {
-                  ideal: 720,
-                },
-              },
-            },
-          )
-
-        streamRef.current =
-          stream
-
-        const video =
-          videoRef.current
-
-        if (!video) {
-          throw new Error(
-            'Video element is unavailable.',
-          )
-        }
-
-        video.srcObject = stream
-
-        await video.play()
-
-        setStatus(
-          'LIVE NEURAL TRACKING',
-        )
-
-        setSubStatus(
-          'STATE: MIRRORED COORDINATES',
-        )
-
-        lastVideoTimeRef.current =
-          -1
-
-        rafRef.current =
-          requestAnimationFrame(
-            scanVideoFrame,
-          )
-      } catch (err) {
-        console.error(err)
-
-        stopCameraTracks()
-
-        setScannerMode('idle')
-
-        setStatus(
-          'CAMERA ACCESS FAILED',
-        )
-
-        setSubStatus(
-          'STATE: ERROR',
-        )
-
-        setError(
-          'Camera permission was denied or the camera is unavailable.',
-        )
-      }
-    }, [
-      clearObjectUrl,
-      modelReady,
-      scanVideoFrame,
-      setScannerMode,
-      stopAnimationLoop,
-      stopCameraTracks,
-      switchRunningMode,
-    ])
-
-  const saveAsset =
-    useCallback(() => {
-      if (
-        !faceData ||
-        !sourceDataUrlRef.current
-      ) {
-        setError(
-          'A reconstructed source image is required before saving.',
-        )
-
-        return
-      }
-
-      const asset: SavedAsset = {
-        id: crypto.randomUUID
-          ? crypto.randomUUID()
-          : `${Date.now()}`,
-        name:
-          sourceName.trim() ||
-          'Untitled Face',
-        createdAt:
-          new Date().toISOString(),
-        sourceImage:
-          sourceDataUrlRef.current,
-        positions: Array.from(
-          faceData.positions,
-        ),
-        uvs: Array.from(
-          faceData.uvs,
-        ),
-        mirrored:
-          Boolean(faceData.mirrored),
-      }
-
-      let assets: SavedAsset[] = []
-
-      try {
-        const existing =
-          localStorage.getItem(
-            ASSET_STORAGE_KEY,
-          )
-
-        if (existing) {
-          assets =
-            JSON.parse(existing)
-        }
-      } catch {
-        assets = []
-      }
-
-      assets.push(asset)
-
-      try {
-        localStorage.setItem(
-          ASSET_STORAGE_KEY,
-          JSON.stringify(assets),
-        )
-
-        setAssetSaved(true)
-        setStatus('ASSET SAVED')
-        setSubStatus(
-          'STATE: LOCAL FACE LIBRARY',
-        )
-      } catch {
-        setError(
-          'The asset is too large for browser storage. Try a smaller source image.',
-        )
-      }
-    }, [
-      faceData,
-      sourceName,
-    ])
-
-  const reset =
-    useCallback(() => {
-      stopWebcam()
-      clearObjectUrl()
-
-      setFaceData(null)
-      setImageSrc(null)
-      sourceDataUrlRef.current = null
-      setAssetSaved(false)
-      setError(null)
-      setSourceName('Untitled Face')
-      setSourceTimestamp('')
-
-      setStatus(
-        'AWAITING NEURAL INPUT',
-      )
-
-      setSubStatus('STATE: IDLE')
-    }, [
-      clearObjectUrl,
-      stopWebcam,
-    ])
-
-  const modelReadyText =
-    modelReady
-      ? 'VISION CORE ONLINE'
-      : 'LOADING VISION CORE'
-
-  const landmarkCount =
-    faceData
-      ? faceData.positions.length / 3
-      : undefined
-
-  const sourcePanel =
-    mode !== 'idle' &&
-    (imageSrc || mode === 'webcam')
-
-  const modelLabel =
-    faceData
-      ? 'RECONSTRUCTED HEAD'
-      : 'BLANK HEAD'
-
-  const controlHint =
-    'DRAG ROTATE · PINCH / WHEEL ZOOM'
-
-  const timestampLabel =
-    useMemo(
-      () =>
-        sourceTimestamp ||
-        'Waiting for source',
-      [sourceTimestamp],
-    )
+  const reset = () => {
+    stopCamera()
+    setFace(null)
+    setImageUrl(null)
+    setName('Untitled scan')
+    setSaved(false)
+    setError('')
+    setStatus('Ready for a face image')
+    modeRef.current = 'idle'
+    setMode('idle')
+  }
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[#070708] text-white">
-      <BootLoader />
-      <RotateOverlay />
-
-      <div className="absolute inset-0 z-0 bg-[radial-gradient(circle_at_65%_45%,rgba(120,95,255,.14),transparent_32%),radial-gradient(circle_at_18%_30%,rgba(140,255,106,.07),transparent_26%)]" />
-
-      <div className="absolute inset-0 z-0">
-        {mode === 'webcam' && (
-          <video
-            ref={videoRef}
-            className="pointer-events-none h-full w-full object-cover opacity-[0.14]"
-            style={{
-              transform:
-                'scaleX(-1)',
-            }}
-            playsInline
-            muted
-            autoPlay
-          />
-        )}
-
-        <div className="absolute inset-0 bg-[#070708]/65" />
-        <div className="scanlines absolute inset-0 opacity-25" />
-      </div>
-
-      <Canvas
-        className="!absolute inset-0 z-10"
-        gl={{
-          antialias: true,
-          alpha: true,
-          powerPreference:
-            'high-performance',
-        }}
-        dpr={[1, 1.5]}
-      >
-        <Suspense fallback={null}>
-          <PerspectiveCamera
-            makeDefault
-            position={[0, 0, 5.2]}
-            fov={42}
-          />
-
-          <ambientLight intensity={1.15} />
-
-          <directionalLight
-            position={[2, 3, 4]}
-            intensity={1.65}
-          />
-
-          <pointLight
-            position={[-2.5, 0.5, 2]}
-            intensity={1.35}
-            color="#8cff6a"
-          />
-
-          <pointLight
-            position={[2.2, 1, 1.5]}
-            intensity={1.15}
-            color="#9b7cff"
-          />
-
-          <BlankHead
-            visible={
-              showBlankHead ||
-              !faceData
-            }
-          />
-
-          {faceData && (
-            <FaceMesh3D
-              faceData={faceData}
-              texture={
-                mode === 'upload'
-                  ? imageSrc
-                  : null
-              }
-              showWireframe={
-                showWireframe
-              }
-              showPoints={
-                showPoints
-              }
-              reconstructionKey={`${assetVersion}-${mode}`}
-            />
-          )}
-
-          <OrbitControls
-            makeDefault
-            enableDamping
-            dampingFactor={0.075}
-            minDistance={2.4}
-            maxDistance={8}
-            rotateSpeed={0.72}
-            zoomSpeed={0.8}
-            panSpeed={0.35}
-            enablePan
-            screenSpacePanning
-          />
-        </Suspense>
-      </Canvas>
-
-      <div className="pointer-events-none absolute inset-0 z-20 flex flex-col justify-between p-3 sm:p-5">
-        <header className="flex items-start justify-between gap-3">
-          <div className="glass-panel border-white/10 px-4 py-3 shadow-glass">
-            <div className="flex items-center gap-3">
-              <span className="h-2 w-2 rounded-full bg-accent shadow-[0_0_18px_rgba(140,255,106,.8)]" />
-
-              <div>
-                <h1 className="font-mono text-xs font-bold uppercase tracking-[0.28em] text-white">
-                  Neural Face Scanner
-                </h1>
-
-                <p className="mt-1 font-mono text-[8px] uppercase tracking-[0.24em] text-zinc-500">
-                  3D facial surface reconstruction
-                </p>
-              </div>
-            </div>
+    <main className="app-shell" id="top">
+      <header className="topbar">
+        <a className="brand" href="#top" aria-label="Neural Face Studio home">
+          <span className="brand-mark"><span>N</span><i /></span>
+          <span className="brand-copy"><strong>NEURAL<span>/</span>FACE</strong><small>RECONSTRUCTION STUDIO</small></span>
+        </a>
+        <div className="topbar-right">
+          <span className="build-tag">BROWSER STUDIO <b>01</b></span>
+          <div className="top-status"><i className={modelState === 'ready' ? 'online' : modelState === 'error' ? 'offline' : ''} />
+            {modelState === 'ready' ? 'ENGINE READY' : modelState === 'error' ? 'ENGINE OFFLINE' : 'INITIALIZING ENGINE'}
           </div>
-
-          <div className="glass-panel hidden border-white/10 px-3 py-2 sm:block">
-            <p className="font-mono text-[8px] uppercase tracking-[0.18em] text-zinc-500">
-              {modelReadyText}
-            </p>
-          </div>
-        </header>
-
-        <section className="mx-auto flex w-full max-w-6xl flex-1 items-center justify-center py-6">
-          <div className="grid w-full grid-cols-1 gap-3 lg:grid-cols-[minmax(230px,0.78fr)_minmax(360px,1.4fr)]">
-            <AnimatePresence mode="wait">
-              {sourcePanel ? (
-                <motion.aside
-                  key="source-panel"
-                  initial={{
-                    opacity: 0,
-                    x: -18,
-                  }}
-                  animate={{
-                    opacity: 1,
-                    x: 0,
-                  }}
-                  className="glass-panel pointer-events-auto flex min-h-[260px] flex-col border-white/10 p-3 shadow-glass"
-                >
-                  <div className="mb-3 flex items-center justify-between">
-                    <div>
-                      <p className="font-mono text-[9px] uppercase tracking-[0.26em] text-accent">
-                        SOURCE
-                      </p>
-
-                      <p className="mt-1 font-mono text-[8px] uppercase tracking-[0.16em] text-zinc-500">
-                        Persistent reference
-                      </p>
-                    </div>
-
-                    <span className="font-mono text-[8px] text-zinc-600">
-                      {mode === 'webcam'
-                        ? 'LIVE'
-                        : 'IMAGE'}
-                    </span>
-                  </div>
-
-                  <div className="relative min-h-0 flex-1 overflow-hidden rounded-xl border border-white/10 bg-black/30">
-                    {mode ===
-                      'upload' &&
-                      imageSrc && (
-                        <img
-                          src={imageSrc}
-                          alt="Uploaded face source"
-                          className="h-full min-h-[230px] w-full object-contain"
-                        />
-                      )}
-
-                    {mode ===
-                      'webcam' && (
-                      <video
-                        ref={
-                          videoRef
-                        }
-                        className="h-full min-h-[230px] w-full object-cover"
-                        style={{
-                          transform:
-                            'scaleX(-1)',
-                        }}
-                        playsInline
-                        muted
-                        autoPlay
-                      />
-                    )}
-
-                    <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent" />
-
-                    <div className="absolute bottom-2 left-2 right-2 flex items-end justify-between gap-2">
-                      <span className="rounded-lg border border-white/10 bg-black/55 px-2 py-1 font-mono text-[8px] uppercase tracking-[0.12em] text-zinc-300 backdrop-blur-md">
-                        {landmarkCount
-                          ? `${landmarkCount} LANDMARKS`
-                          : 'ANALYZING'}
-                      </span>
-
-                      <span className="rounded-lg border border-white/10 bg-black/55 px-2 py-1 font-mono text-[8px] text-zinc-500 backdrop-blur-md">
-                        {timestampLabel}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="mt-3">
-                    <label className="font-mono text-[8px] uppercase tracking-[0.18em] text-zinc-600">
-                      Asset name
-                    </label>
-
-                    <input
-                      value={sourceName}
-                      onChange={(event) => {
-                        setSourceName(
-                          event.target.value,
-                        )
-                        setAssetSaved(
-                          false,
-                        )
-                      }}
-                      className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-[10px] text-white outline-none transition focus:border-accent/40"
-                      maxLength={80}
-                    />
-                  </div>
-                </motion.aside>
-              ) : (
-                <div className="hidden lg:block" />
-              )}
-            </AnimatePresence>
-
-            <div className="glass-panel relative min-h-[440px] overflow-hidden border-white/10 shadow-glass lg:min-h-[560px]">
-              <div className="pointer-events-none absolute left-4 top-4 z-10">
-                <p className="font-mono text-[9px] uppercase tracking-[0.26em] text-accent">
-                  3D RECONSTRUCTION
-                </p>
-
-                <p className="mt-1 font-mono text-[8px] uppercase tracking-[0.16em] text-zinc-600">
-                  {modelLabel}
-                </p>
-              </div>
-
-              <div className="pointer-events-none absolute right-4 top-4 z-10 text-right">
-                <p className="font-mono text-[8px] uppercase tracking-[0.15em] text-zinc-600">
-                  {controlHint}
-                </p>
-              </div>
-
-              <div className="pointer-events-none absolute bottom-4 left-4 z-10 flex gap-2">
-                <span className="rounded-md border border-white/10 bg-black/30 px-2 py-1 font-mono text-[7px] uppercase tracking-[0.14em] text-zinc-600 backdrop-blur-md">
-                  X/Y/Z FACE SPACE
-                </span>
-
-                <span className="rounded-md border border-white/10 bg-black/30 px-2 py-1 font-mono text-[7px] uppercase tracking-[0.14em] text-zinc-600 backdrop-blur-md">
-                  TRIANGULATED
-                </span>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-2">
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={`${status}-${subStatus}`}
-              initial={{
-                opacity: 0,
-                y: 12,
-              }}
-              animate={{
-                opacity: 1,
-                y: 0,
-              }}
-              exit={{
-                opacity: 0,
-                y: -12,
-              }}
-              className="mx-auto"
-            >
-              <StatusBox
-                status={status}
-                subStatus={subStatus}
-                landmarks={
-                  landmarkCount
-                }
-              />
-            </motion.div>
-          </AnimatePresence>
-
-          {error && (
-            <div className="glass-panel mx-auto max-w-xl border-red-400/20 px-4 py-3 text-center font-mono text-[9px] uppercase tracking-[0.16em] text-red-200">
-              {error}
-            </div>
-          )}
-
-          <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-2">
-            {mode === 'idle' && (
-              <>
-                <input
-                  ref={inputRef}
-                  type="file"
-                  accept="image/*"
-                  onChange={
-                    handleImageUpload
-                  }
-                  className="hidden"
-                />
-
-                <HudButton
-                  onClick={() =>
-                    inputRef.current?.click()
-                  }
-                >
-                  UPLOAD IMAGE
-                </HudButton>
-
-                <HudButton
-                  onClick={startWebcam}
-                  variant="accent"
-                >
-                  LIVE WEBCAM
-                </HudButton>
-              </>
-            )}
-
-            {faceData && (
-              <>
-                <HudButton
-                  onClick={() =>
-                    setShowBlankHead(
-                      (value) =>
-                        !value,
-                    )
-                  }
-                  title="Toggle blank head"
-                >
-                  {showBlankHead
-                    ? 'HEAD ON'
-                    : 'HEAD OFF'}
-                </HudButton>
-
-                <HudButton
-                  onClick={() =>
-                    setShowWireframe(
-                      (value) =>
-                        !value,
-                    )
-                  }
-                  title="Toggle triangulation"
-                >
-                  {showWireframe
-                    ? 'TRIANGLES ON'
-                    : 'TRIANGLES OFF'}
-                </HudButton>
-
-                <HudButton
-                  onClick={() =>
-                    setShowPoints(
-                      (value) =>
-                        !value,
-                    )
-                  }
-                  title="Toggle landmarks"
-                >
-                  {showPoints
-                    ? 'POINTS ON'
-                    : 'POINTS OFF'}
-                </HudButton>
-
-                {mode ===
-                  'upload' && (
-                  <HudButton
-                    onClick={
-                      saveAsset
-                    }
-                    variant="accent"
-                    disabled={
-                      assetSaved
-                    }
-                  >
-                    {assetSaved
-                      ? 'ASSET SAVED'
-                      : 'SAVE ASSET'}
-                  </HudButton>
-                )}
-
-                <HudButton
-                  onClick={reset}
-                  variant="danger"
-                >
-                  RESET
-                </HudButton>
-              </>
-            )}
-          </div>
-
-          <footer className="flex items-center justify-between gap-4 py-1">
-            <div className="font-mono text-[8px] uppercase tracking-[0.2em] text-zinc-600">
-              MediaPipe · Three.js · React · Local Asset Store
-            </div>
-
-            <div className="text-right font-mono text-[8px] uppercase tracking-[0.2em] text-zinc-600">
-              <div>
-                {mode === 'webcam'
-                  ? 'MIRROR-SAFE LIVE PIPELINE'
-                  : 'SOURCE-LOCKED RECONSTRUCTION'}
-              </div>
-
-              <div className="mt-1">
-                TEJAS / NEURAL LAB
-              </div>
-            </div>
-          </footer>
         </div>
-      </div>
+      </header>
+
+      <section className="workspace">
+        <aside className="control-panel">
+          <div className="panel-kicker"><span className="eyebrow">WORKSPACE / 01</span><span className="live-indicator"><i /> LOCAL SESSION</span></div>
+          <div className="intro-block">
+            <p className="overline">2D INPUT <span>→</span> 2.5D OUTPUT</p>
+            <h1>Bring a face<br />into <em>focus.</em></h1>
+            <p className="intro">Create an interactive facial surface from a portrait or live camera feed.</p>
+          </div>
+
+          <div className="input-actions">
+            <button className="primary-button" onClick={() => inputRef.current?.click()} disabled={modelState !== 'ready'}>
+              <span className="button-icon">↑</span><span><strong>Upload portrait</strong><small>JPG, PNG, WEBP</small></span><b className="button-arrow">↗</b>
+            </button>
+            <button className="secondary-button camera-button" onClick={startCamera} disabled={modelState !== 'ready' || cameraReady}>
+              <span className="camera-icon" /><span><strong>{cameraReady ? 'Camera running' : 'Use camera'}</strong><small>Live face tracking</small></span><b className="button-arrow">→</b>
+            </button>
+            <input ref={inputRef} type="file" accept="image/*" onChange={processImage} hidden />
+          </div>
+
+          <div className="section-divider"><span>INPUT SOURCE</span><span>01</span></div>
+          <div className="section-heading"><span>PORTRAIT PREVIEW</span><span className={`source-state ${mode}`}>{mode === 'webcam' ? 'LIVE' : mode === 'upload' ? 'LOADED' : 'EMPTY'}</span></div>
+          <div className={`source-preview ${mode === 'webcam' ? 'is-live' : ''}`}>
+            <video ref={videoRef} className={mode === 'webcam' ? 'source-video visible' : 'source-video'} muted playsInline autoPlay />
+            {mode === 'upload' && imageUrl ? <img src={imageUrl} alt="Uploaded source portrait" /> : null}
+            {mode === 'idle' && <div className="empty-source"><span className="empty-source-icon">＋</span><b>No source selected</b><small>Your portrait will appear here</small></div>}
+            {mode === 'webcam' && <span className="camera-live-label"><i /> CAMERA FEED</span>}
+          </div>
+          {mode === 'upload' && <label className="field-label">SCAN NAME<input value={name} maxLength={80} onChange={e => { setName(e.target.value); setSaved(false) }} /></label>}
+
+          <div className="section-divider display-divider"><span>VIEW SETTINGS</span><span>02</span></div>
+          <div className="section-heading"><span>MODEL DISPLAY</span><span>CONFIGURE</span></div>
+          <label className="toggle-row"><span><b className="toggle-title">Triangulation lines</b><small>Show mesh topology</small></span><input type="checkbox" checked={wireframe} onChange={e => setWireframe(e.target.checked)} /><b className="toggle-track" /></label>
+          <label className="toggle-row"><span><b className="toggle-title">Landmark points</b><small>Show detected coordinates</small></span><input type="checkbox" checked={points} onChange={e => setPoints(e.target.checked)} /><b className="toggle-track" /></label>
+
+          <div className="panel-bottom"><span><i /> LOCAL PROCESSING</span><span>MEDIAPIPE / THREE.JS</span></div>
+        </aside>
+
+        <section className="viewport-panel">
+          <div className="viewport-top">
+            <div><span className="eyebrow">CANVAS / 02</span><h2>{face ? 'Facial surface' : '3D workspace'}</h2><p>{face ? 'Inspect your generated facial landmark surface.' : 'Your reconstructed model will appear in this space.'}</p></div>
+            <div className="viewport-tools"><span className={`view-badge ${face ? 'active' : ''}`}><i />{face ? 'MODEL ACTIVE' : 'AWAITING INPUT'}</span><button className="reset-icon" onClick={reset} aria-label="Reset workspace" title="Reset workspace">↺</button></div>
+          </div>
+
+          <div className="viewport-canvas">
+            <div className="viewport-grid" />
+            <div className="viewport-glow" />
+            <Canvas dpr={[1, 1.5]} gl={{ antialias: true, alpha: true, powerPreference: 'high-performance' }}>
+              <Suspense fallback={null}>
+                <PerspectiveCamera makeDefault position={[0, 0, 5.1]} fov={42} />
+                <ambientLight intensity={1.2} />
+                <directionalLight position={[2, 3, 4]} intensity={1.7} />
+                <pointLight position={[-2, 0, 2]} intensity={1.1} color="#16e0a0" />
+                <pointLight position={[2, -1, -2]} intensity={0.7} color="#287bff" />
+                {face && <FaceMesh3D faceData={face} texture={mode === 'upload' ? imageUrl : null} showWireframe={wireframe} showPoints={points} />}
+                <OrbitControls makeDefault enableDamping dampingFactor={0.08} minDistance={2.2} maxDistance={8} enablePan={false} />
+              </Suspense>
+            </Canvas>
+            {!face && <div className="viewport-empty"><div className="empty-orbit"><span /><span /><span /><b>NF</b></div><strong>Nothing on the canvas. Yet.</strong><p>Upload a portrait or activate your camera to generate a facial surface.</p><span className="empty-hint">SUPPORTED INPUT · PHOTO / LIVE CAMERA</span></div>}
+            <div className="axis-label">X <i /> Y <i /> Z <span>WORLD COORDINATES</span></div>
+            <div className="drag-label">DRAG TO ROTATE <span>·</span> PINCH TO ZOOM</div>
+            {face && <div className="canvas-model-chip"><i /> FACIAL MESH <span>LIVE VIEW</span></div>}
+          </div>
+
+          <div className="viewport-footer">
+            <div className="status-line"><i className={face || cameraReady ? 'online' : ''} /><span>{status}</span></div>
+            <div className="model-meta"><span>{face ? `${face.positions.length / 3} VERTICES` : '— VERTICES'}</span><span>{face ? 'LANDMARK SURFACE' : 'NO GEOMETRY'}</span></div>
+          </div>
+          {error && <div className="error-banner" role="alert"><span>!</span>{error}</div>}
+          <div className="bottom-actions"><p className="disclaimer">A landmark-driven facial surface — not a complete volumetric head scan.</p><div className="action-group">{mode === 'webcam' && <button className="text-action danger" onClick={reset}>Stop camera <span>×</span></button>}{mode === 'upload' && <button className="text-action" onClick={saveScan} disabled={!face}>{saved ? '✓ Saved locally' : 'Save scan ↗'}</button>}{mode !== 'idle' && <button className="text-action" onClick={reset}>Reset workspace ↺</button>}</div></div>
+        </section>
+      </section>
+      <footer className="app-footer"><span>NEURAL / FACE <b>·</b> EXPERIMENTAL RECONSTRUCTION TOOL</span><span>PHOTO → LANDMARKS → SURFACE <i /> V 0.2</span></footer>
     </main>
   )
 }
-
-export default App
