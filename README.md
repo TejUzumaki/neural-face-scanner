@@ -34,3 +34,9 @@ npm run preview -- --host 0.0.0.0
 - No full-head reconstruction or hidden-surface inference.
 - No GLB/GLTF export in this build.
 - Saved scans are local to the current browser profile and may be limited by browser storage quota.
+
+## Vision model loading and local cache
+
+The Face Landmarker model binary is downloaded on first use and cached in the browser's IndexedDB storage for this origin. On later visits, the app reuses that local model binary instead of downloading it again. The MediaPipe WebAssembly runtime and the Face Landmarker instance are still initialized for each page session; an initialized runtime cannot be kept alive across a full page reload. The browser's normal HTTP cache may also reuse the hosted WASM assets.
+
+If the local model cache is cleared, unavailable, or invalid, the app downloads the model again. The upload and camera actions remain visually available during setup and the interface shows whether it is checking the device cache, downloading the model, or initializing the runtime.

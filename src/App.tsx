@@ -5,9 +5,81 @@ import * as vision from '@mediapipe/tasks-vision'
 import FaceMesh3D, { type FaceData } from './components/FaceMesh3D'
 
 type Mode = 'idle' | 'upload' | 'webcam'
+type EngineState = 'checking' | 'downloading' | 'initializing' | 'ready' | 'error'
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm'
 const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
 const STORAGE_KEY = 'neural-face-scanner-assets-v2'
+const MODEL_CACHE_DB = 'neural-face-scanner-model-cache'
+const MODEL_CACHE_STORE = 'assets'
+const MODEL_CACHE_KEY = 'face-landmarker-float16-v1'
+
+function openModelCache(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) { reject(new Error('IndexedDB is unavailable')); return }
+    const request = indexedDB.open(MODEL_CACHE_DB, 1)
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(MODEL_CACHE_STORE)) db.createObjectStore(MODEL_CACHE_STORE)
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error || new Error('Could not open local model cache'))
+  })
+}
+
+async function readCachedModel(): Promise<ArrayBuffer | null> {
+  try {
+    const db = await openModelCache()
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction(MODEL_CACHE_STORE, 'readonly').objectStore(MODEL_CACHE_STORE).get(MODEL_CACHE_KEY)
+      request.onsuccess = () => {
+        const value = request.result
+        db.close()
+        resolve(value instanceof ArrayBuffer && value.byteLength > 1_000_000 ? value : null)
+      }
+      request.onerror = () => { db.close(); reject(request.error) }
+    })
+  } catch { return null }
+}
+
+async function writeCachedModel(buffer: ArrayBuffer): Promise<void> {
+  try {
+    const db = await openModelCache()
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(MODEL_CACHE_STORE, 'readwrite')
+      transaction.objectStore(MODEL_CACHE_STORE).put(buffer, MODEL_CACHE_KEY)
+      transaction.oncomplete = () => { db.close(); resolve() }
+      transaction.onerror = () => { db.close(); reject(transaction.error) }
+      transaction.onabort = () => { db.close(); reject(transaction.error) }
+    })
+  } catch (error) {
+    console.warn('Model cache could not be saved; browser network cache may still help next time.', error)
+  }
+}
+
+async function downloadModel(onProgress: (progress: number) => void): Promise<ArrayBuffer> {
+  const response = await fetch(MODEL_URL, { cache: 'force-cache' })
+  if (!response.ok) throw new Error(`Face model download failed (${response.status}). Check your connection and reload.`)
+  const total = Number(response.headers.get('content-length') || 0)
+  if (!response.body) {
+    const buffer = await response.arrayBuffer()
+    onProgress(100)
+    return buffer
+  }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let received = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value) { chunks.push(value); received += value.length }
+    if (total > 0) onProgress(Math.min(99, Math.round((received / total) * 100)))
+  }
+  const output = new Uint8Array(received)
+  let offset = 0
+  for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length }
+  onProgress(100)
+  return output.buffer
+}
 
 function toFaceData(landmarks: vision.NormalizedLandmark[], mirrored = false): FaceData {
   const positions = new Float32Array(landmarks.length * 3)
@@ -48,7 +120,9 @@ export default function App() {
   const [name, setName] = useState('Untitled scan')
   const [status, setStatus] = useState('Ready for a face image')
   const [error, setError] = useState('')
-  const [modelState, setModelState] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [modelState, setModelState] = useState<EngineState>('checking')
+  const [modelProgress, setModelProgress] = useState(0)
+  const [modelSource, setModelSource] = useState<'cached' | 'download' | null>(null)
   const [wireframe, setWireframe] = useState(true)
   const [points, setPoints] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -84,31 +158,52 @@ export default function App() {
     let cancelled = false
     async function init() {
       try {
+        setModelState('checking')
+        setStatus('Checking this device for the saved face model…')
+        let modelBuffer = await readCachedModel()
+        const loadedFromCache = Boolean(modelBuffer)
+        if (modelBuffer) {
+          setModelSource('cached')
+          setModelProgress(100)
+          setStatus('Local face model found · preparing this session…')
+        } else {
+          setModelSource('download')
+          setModelState('downloading')
+          setModelProgress(0)
+          setStatus('First-time setup · downloading the face model to this device…')
+          modelBuffer = await downloadModel(setModelProgress)
+          if (modelBuffer.byteLength < 1_000_000) throw new Error('The downloaded face model looks incomplete. Check your connection and reload.')
+          await writeCachedModel(modelBuffer)
+        }
+        if (cancelled) return
+        setModelState('initializing')
+        setStatus('Starting the vision engine · this takes a moment…')
         const fileset = await vision.FilesetResolver.forVisionTasks(WASM_URL)
         let landmarker: vision.FaceLandmarker
         try {
           landmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+            baseOptions: { modelAssetBuffer: new Uint8Array(modelBuffer), delegate: 'GPU' },
             runningMode: 'IMAGE', numFaces: 1,
             minFaceDetectionConfidence: 0.5,
             minFacePresenceConfidence: 0.5,
             minTrackingConfidence: 0.5,
           })
-        } catch {
+        } catch (gpuError) {
+          console.warn('GPU delegate unavailable; falling back to CPU.', gpuError)
           landmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
+            baseOptions: { modelAssetBuffer: new Uint8Array(modelBuffer), delegate: 'CPU' },
             runningMode: 'IMAGE', numFaces: 1,
           })
         }
         if (cancelled) { landmarker.close(); return }
         landmarkerRef.current = landmarker
         setModelState('ready')
-        setStatus('Vision engine ready · waiting for input')
+        setStatus(loadedFromCache ? 'Vision engine ready · local model restored' : 'Vision engine ready · model saved on this device')
       } catch (e) {
         console.error(e)
         if (!cancelled) {
           setModelState('error')
-          setError('Face detection could not load. Check your connection, then reload. The model and WASM files are downloaded from their hosted sources.')
+          setError(e instanceof Error ? e.message : 'Face detection could not load. Check your connection and reload.')
           setStatus('Vision engine unavailable')
         }
       }
@@ -260,7 +355,7 @@ export default function App() {
         <div className="topbar-right">
           <span className="build-tag">BROWSER STUDIO <b>01</b></span>
           <div className="top-status"><i className={modelState === 'ready' ? 'online' : modelState === 'error' ? 'offline' : ''} />
-            {modelState === 'ready' ? 'ENGINE READY' : modelState === 'error' ? 'ENGINE OFFLINE' : 'INITIALIZING ENGINE'}
+            {modelState === 'ready' ? 'ENGINE READY' : modelState === 'error' ? 'ENGINE OFFLINE' : modelState === 'downloading' ? 'DOWNLOADING MODEL' : modelState === 'checking' ? 'CHECKING DEVICE' : 'STARTING ENGINE'}
           </div>
         </div>
       </header>
@@ -275,10 +370,16 @@ export default function App() {
           </div>
 
           <div className="input-actions">
-            <button className="primary-button" onClick={() => inputRef.current?.click()} disabled={modelState !== 'ready'}>
+            {modelState !== 'ready' && <div className={`engine-loader ${modelState === 'error' ? 'has-error' : ''}`} role="status" aria-live="polite">
+              <div className="stone-pile" aria-hidden="true"><i /><i /><i /><i /><i /></div>
+              <div className="engine-loader-copy"><strong>{modelState === 'error' ? 'MODEL SETUP NEEDS ATTENTION' : modelState === 'downloading' ? 'PREPARING THIS DEVICE' : modelState === 'checking' ? 'CHECKING LOCAL MODEL' : 'STARTING VISION ENGINE'}</strong><span>{modelState === 'error' ? 'The model could not be prepared. Reload to retry.' : modelState === 'downloading' ? 'First visit: downloading the model. It will be saved locally for future visits.' : modelState === 'checking' ? 'Checking whether the face model is already stored on this device.' : modelSource === 'cached' ? 'Local model found. The browser is starting the vision runtime for this session.' : 'Model ready. Initializing the vision runtime.'}</span></div>
+              {modelState === 'downloading' && <div className="engine-progress"><i style={{ width: `${modelProgress}%` }} /></div>}
+              {modelState === 'error' && <button className="engine-retry" onClick={() => window.location.reload()}>Retry setup ↻</button>}
+            </div>}
+            <button className="primary-button" onClick={() => { if (modelState === 'ready') inputRef.current?.click(); else setStatus('The face model is still being prepared. You can use this action as soon as ENGINE READY appears.') }}>
               <span className="button-icon">↑</span><span><strong>Upload portrait</strong><small>JPG, PNG, WEBP</small></span><b className="button-arrow">↗</b>
             </button>
-            <button className="secondary-button camera-button" onClick={startCamera} disabled={modelState !== 'ready' || cameraReady}>
+            <button className="secondary-button camera-button" onClick={startCamera}>
               <span className="camera-icon" /><span><strong>{cameraReady ? 'Camera running' : 'Use camera'}</strong><small>Live face tracking</small></span><b className="button-arrow">→</b>
             </button>
             <input ref={inputRef} type="file" accept="image/*" onChange={processImage} hidden />
